@@ -6,14 +6,14 @@ import time
 import copy
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from ..model.entities import Snapshot
+from ..model.entities import Snapshot, NodePool
 from ..snapshot.from_legacy import snapshot_from_legacy_data
 from ..snapshot.collector import collect_k8s_snapshot
 from ..snapshot.io import save_snapshot_to_file, load_snapshot_from_file
@@ -26,6 +26,7 @@ from ..sim.operations import (
     delete_pods,
     delete_namespace,
     delete_owner,
+    patch_pods_in_snapshot,  # NEW
 )
 from ..sim.constraints import check_all_placements
 from ..sim import costs as sim_costs
@@ -38,6 +39,8 @@ from .schema import (
     PodViewModel,
     MutateRequest,
     OperationModel,
+    PlanMoveRequest,   # NEW
+    PlanMoveResponse,  # NEW
 )
 from ..sim.packing import move_pods_to_pool
 
@@ -150,7 +153,6 @@ def to_simulation_response(snapshot) -> SimulationResponse:
         items: List[PodViewModel] = []
         for p in pods:
             # PodId во внутренней структуре PodView уже может быть строкой
-            # Но для надежности соберем
             pod_id = f"{p.namespace}/{p.name}"
             items.append(
                 PodViewModel(
@@ -223,14 +225,12 @@ LEGACY_PATH = Path(__file__).resolve().parents[1] / "snapshot" / "legacy.json"
 
 @app.on_event("startup")
 async def startup_event() -> None:
-    # 1. Load Baseline (legacy.json)
     try:
         if LEGACY_PATH.exists():
             data = json.loads(LEGACY_PATH.read_text("utf-8"))
             baseline = snapshot_from_legacy_data(data)
             manager.add("baseline", baseline)
             
-            # По умолчанию создаем рабочую копию из baseline, если нет других
             working = _clone_snapshot(baseline)
             manager.add("working-copy", working)
             manager.set_active("working-copy")
@@ -238,7 +238,6 @@ async def startup_event() -> None:
     except Exception as e:
         log.warning(f"Failed to load baseline: {e}")
 
-    # 2. Load Persisted Snapshots from disk
     try:
         if not SNAPSHOTS_DIR.exists():
             SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -247,7 +246,6 @@ async def startup_event() -> None:
         for snap_file in SNAPSHOTS_DIR.glob("*.json"):
             try:
                 snap = load_snapshot_from_file(snap_file)
-                # ID = имя файла без расширения
                 sid = snap_file.stem
                 manager.add(sid, snap)
                 count += 1
@@ -259,7 +257,6 @@ async def startup_event() -> None:
     except Exception as e:
         log.error(f"Error loading snapshots directory: {e}")
 
-    # 3. Refresh Prices (Initial)
     current = manager.get_active()
     if current:
         try:
@@ -291,7 +288,6 @@ class CreateSnapshotResponse(BaseModel):
 def list_snapshots():
     result = []
     active = manager.active_id
-    # Сортируем: сначала baseline/working, потом по алфавиту (даты)
     keys = sorted(manager.snapshots.keys())
     
     for sid in keys:
@@ -306,24 +302,18 @@ def list_snapshots():
 
 @app.post("/snapshots/capture", response_model=CreateSnapshotResponse)
 def capture_snapshot():
-    """Сбор текущего состояния кластера и сохранение на диск."""
     try:
         new_snap = collect_k8s_snapshot()
-        
-        # ID = k8s-<timestamp>
         new_id = f"k8s-{int(time.time())}"
         
-        # Сохраняем на диск
         if not SNAPSHOTS_DIR.exists():
             SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
             
         file_path = SNAPSHOTS_DIR / f"{new_id}.json"
         save_snapshot_to_file(new_snap, file_path)
         
-        # Добавляем в менеджер
         manager.add(new_id, new_snap)
         
-        # Обновляем прайсы для новых типов
         try:
             itypes = sorted({
                 _pick_instance_type(n) for n in _iter_nodes(new_snap) if _pick_instance_type(n)
@@ -347,6 +337,84 @@ def activate_snapshot(snapshot_id: str):
         raise HTTPException(status_code=404, detail=str(e))
 
 # ---------------------------------------------------------------------------
+# Logic Helper for Plan
+# ---------------------------------------------------------------------------
+
+def _derive_placement_patches(node: Any, nodepool: Optional[NodePool]) -> tuple[List[Dict], Dict]:
+    """
+    Генерирует Tolerations и NodeSelector, необходимые для того, чтобы под
+    гарантированно попал на указанную ноду (и её пул).
+    """
+    tolerations = []
+    
+    # 1. Собираем Tolerations из Taints ноды
+    node_taints = getattr(node, "taints", []) or []
+    for t in node_taints:
+        # Для каждого Taint создаем Toleration "Exists"
+        tolerations.append({
+            "key": t.get("key"),
+            "operator": "Equal" if t.get("value") else "Exists",
+            "value": t.get("value"),
+            "effect": t.get("effect")
+        })
+
+    # 2. Если есть NodePool, берем и его taints (на всякий случай, если они не проросли в ноду)
+    if nodepool:
+        for t in nodepool.taints:
+            # Проверяем дубли
+            if not any(tol.get("key") == t.get("key") for tol in tolerations):
+                 tolerations.append({
+                    "key": t.get("key"),
+                    "operator": "Equal" if t.get("value") else "Exists",
+                    "value": t.get("value"),
+                    "effect": t.get("effect")
+                })
+    
+    # 3. NodeSelector
+    # Самый надежный способ - привязаться к NodePool Name (karpenter.sh/nodepool)
+    node_selector = {}
+    pool_name = getattr(node, "nodepool", None)
+    if pool_name:
+        node_selector["karpenter.sh/nodepool"] = pool_name
+    
+    return tolerations, node_selector
+
+@app.post("/plan_move", response_model=PlanMoveResponse)
+def plan_move(req: PlanMoveRequest) -> PlanMoveResponse:
+    snap = manager.get_active()
+    if snap is None:
+        raise HTTPException(status_code=500, detail="Snapshot is not initialized")
+    
+    pod = snap.pods.get(req.pod_id)
+    if not pod:
+        # Если pod_id пришел в виде namespace/name, попробуем найти
+        pod = snap.pods.get(PodId(req.pod_id))
+    
+    if not pod:
+         raise HTTPException(status_code=404, detail=f"Pod {req.pod_id} not found")
+         
+    # Ищем целевую ноду
+    # req.target_node это имя ноды
+    target_node = snap.nodes.get(NodeId(req.target_node))
+    if not target_node:
+        raise HTTPException(status_code=404, detail=f"Target node {req.target_node} not found")
+
+    target_pool_name = getattr(target_node, "nodepool", None)
+    target_pool = snap.nodepools.get(target_pool_name) if target_pool_name else None
+    
+    suggested_tols, suggested_sel = _derive_placement_patches(target_node, target_pool)
+    
+    return PlanMoveResponse(
+        pod_id=req.pod_id,
+        owner_kind=getattr(pod, "owner_kind", None),
+        owner_name=getattr(pod, "owner_name", None),
+        current_req_cpu_m=int(pod.req_cpu_m or 0),
+        current_req_mem_b=int(pod.req_mem_b or 0),
+        suggested_tolerations=suggested_tols,
+        suggested_node_selector=suggested_sel
+    )
+
+# ---------------------------------------------------------------------------
 # Simulation API
 # ---------------------------------------------------------------------------
 
@@ -359,7 +427,6 @@ def index() -> FileResponse:
 def simulate() -> SimulationResponse:
     snap = manager.get_active()
     if snap is None:
-        # Если ничего не загрузилось, попробуем вернуть пустое состояние или 500
         raise HTTPException(status_code=500, detail="Snapshot is not initialized")
     return to_simulation_response(snap)
 
@@ -372,45 +439,49 @@ def mutate(req: MutateRequest | OperationModel) -> SimulationResponse:
     ops = req.operations if isinstance(req, MutateRequest) else [req]
     
     for op in ops:
+        # Если заданы overrides, применяем их к подам в снапшоте ПЕРЕД операцией переноса.
+        # Для `move_pods_to_pool` и `move_node_pods_to_pool` это имеет прямой смысл.
+        
         if op.op == "reset_to_baseline":
-            # Пытаемся найти baseline, иначе просто reload текущего с диска, если он сохранен
-            # Логика: если активный снапшот "k8s-...", то reset должен вернуть его к исходному состоянию файла
-            # Если "working-copy", то к "baseline".
-            
-            active_id = manager.active_id
-            
-            if active_id == "working-copy" and "baseline" in manager.snapshots:
+            if "baseline" in manager.snapshots:
                 snap = _clone_snapshot(manager.snapshots["baseline"])
-            
-            elif active_id in manager.snapshots:
-                # Если это сохраненный снапшот, перезагрузим его из памяти (или с диска)
-                # Сейчас в памяти хранится измененная версия? 
-                # Нет, manager хранит ссылку. Mutate возвращает НОВУЮ копию.
-                # Чтобы сделать reset, нам нужно найти исходник.
-                # Упростим: если reset, пробуем загрузить файл заново, если он есть.
-                
-                # Для простоты: Reset всегда возвращает к baseline.json, как было раньше?
-                # Или сбрасывает изменения текущей сессии? 
-                # Давайте сделаем сброс к 'baseline' (legacy.json), так надежнее.
-                if "baseline" in manager.snapshots:
-                    snap = _clone_snapshot(manager.snapshots["baseline"])
-                    # И переключимся на working-copy, чтобы не портить сохраненный файл
-                    manager.add("working-copy", snap)
-                    manager.set_active("working-copy")
-                pass
+                manager.add("working-copy", snap)
+                manager.set_active("working-copy")
 
         elif op.op == "move_namespace_to_pool":
-            snap = move_namespace_to_pool(snap, op.namespace, NodePoolName(op.target_pool))
+            snap = move_namespace_to_pool(
+                snap, op.namespace, NodePoolName(op.target_pool), 
+                overrides=op.overrides
+            )
 
         elif op.op == "move_owner_to_pool":
-            snap = move_owner_to_pool(snap, op.namespace, op.owner_kind, op.owner_name, NodePoolName(op.target_pool))
+            snap = move_owner_to_pool(
+                snap, op.namespace, op.owner_name, NodePoolName(op.target_pool),
+                overrides=op.overrides
+            )
 
         elif op.op == "move_node_pods_to_pool":
-            snap = move_node_pods_to_pool(snap, op.node_name, NodePoolName(op.target_pool))
+            snap = move_node_pods_to_pool(
+                snap, op.node_name, NodePoolName(op.target_pool),
+                overrides=op.overrides
+            )
 
         elif op.op == "move_pods_to_pool":
             tpool = (op.target_pool or "").strip().split()[-1]
-            snap = move_pods_to_pool(snap, [PodId(pid) for pid in op.pod_ids], NodePoolName(tpool))
+            pids = [PodId(pid) for pid in op.pod_ids]
+            
+            # Сначала патчим, если есть чем
+            if op.overrides:
+                snap = patch_pods_in_snapshot(
+                    snap, pids,
+                    req_cpu_m=op.overrides.req_cpu_m,
+                    req_mem_b=op.overrides.req_mem_b,
+                    tolerations=op.overrides.tolerations,
+                    node_selector=op.overrides.node_selector,
+                    affinity=op.overrides.affinity
+                )
+                
+            snap = move_pods_to_pool(snap, pids, NodePoolName(tpool))
 
         elif op.op == "delete_pods":
             snap = delete_pods(snap, [PodId(pid) for pid in op.pod_ids])
@@ -419,7 +490,7 @@ def mutate(req: MutateRequest | OperationModel) -> SimulationResponse:
             snap = delete_namespace(snap, op.namespace, op.include_system, op.include_daemonsets)
 
         elif op.op == "delete_owner":
-            snap = delete_owner(snap, op.namespace, op.owner_kind, op.owner_name, op.include_system, op.include_daemonsets)
+            snap = delete_owner(snap, op.namespace, op.owner_name, op.include_system, op.include_daemonsets)
         
         else:
             raise HTTPException(status_code=400, detail=f"Unknown op: {op.op}")

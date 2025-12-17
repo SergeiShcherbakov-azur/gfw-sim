@@ -1,8 +1,11 @@
+# gfw_sim/sim/operations.py
 from __future__ import annotations
 
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Sequence, Optional, Dict, Any
+from copy import deepcopy
 
 from .packing import move_pods_to_pool
+from ..model.entities import Pod, CpuMillis, Bytes, Snapshot
 
 
 # ---------------------------------------------------------------------------
@@ -133,11 +136,6 @@ def _filter_pods_for_move(
 ) -> List[str]:
     """
     Фильтрует список pod_ids в зависимости от флагов include_system/include_daemonsets.
-
-    Логика:
-      - daemonset-поды переносятся только если include_daemonsets=True;
-      - system-поды переносятся только если include_system=True;
-      - обычные workload-поды (не system, не daemonset) всегда переносятся.
     """
     pods = getattr(snapshot, "pods", {})
     result: List[str] = []
@@ -167,15 +165,74 @@ def _filter_pods_for_move(
 
 def _normalize_pool_name(target_pool: str) -> str:
     """
-    Нормализует имя пула:
-      - если пришло что-то вроде "mpute.internal keda-nightly-al2023-private-c",
-        берём последнее слово ("keda-nightly-al2023-private-c");
-      - если пробелов нет, возвращаем как есть.
+    Нормализует имя пула.
     """
     if not target_pool:
         return target_pool
     parts = str(target_pool).split()
     return parts[-1]
+
+
+# ---------------------------------------------------------------------------
+# Патчинг подов (NEW)
+# ---------------------------------------------------------------------------
+
+def patch_pods_in_snapshot(
+    snapshot: Snapshot,
+    pod_ids: Iterable[str],
+    req_cpu_m: Optional[int] = None,
+    req_mem_b: Optional[int] = None,
+    tolerations: Optional[List[Dict[str, Any]]] = None,
+    node_selector: Optional[Dict[str, str]] = None,
+    affinity: Optional[Dict[str, Any]] = None,
+) -> Snapshot:
+    """
+    Создает новый снапшот, в котором указанные поды имеют обновленные поля.
+    Используется перед переносом, чтобы "исправить" ресурсы или scheduling constraints.
+    """
+    pods_to_patch = set(pod_ids)
+    if not pods_to_patch:
+        return snapshot
+
+    # Копируем структуру подов, так как Snapshot частично мутабелен в текущей реализации,
+    # но лучше перестраховаться и сделать shallow copy словаря + deepcopy изменяемых подов.
+    new_pods = dict(snapshot.pods)
+    
+    for pid in pods_to_patch:
+        original = new_pods.get(pid)
+        if not original:
+            continue
+        
+        # Полная копия объекта пода
+        p = deepcopy(original)
+        
+        if req_cpu_m is not None:
+            p.req_cpu_m = CpuMillis(req_cpu_m)
+        if req_mem_b is not None:
+            p.req_mem_b = Bytes(req_mem_b)
+        
+        if tolerations is not None:
+            # Заменяем список целиком
+            p.tolerations = deepcopy(tolerations)
+        
+        if node_selector is not None:
+            # Заменяем селектор целиком
+            p.node_selector = deepcopy(node_selector)
+        
+        if affinity is not None:
+            p.affinity = deepcopy(affinity)
+            
+        new_pods[pid] = p
+
+    # Возвращаем новый снапшот (ноды и прочее по ссылке, поды - новый словарь)
+    return Snapshot(
+        nodes=snapshot.nodes,
+        pods=new_pods,
+        nodepools=snapshot.nodepools,
+        prices=snapshot.prices,
+        schedules=snapshot.schedules,
+        keda_pool_name=snapshot.keda_pool_name
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -189,24 +246,11 @@ def move_node_pods_to_pool(
     target_pool: str,
     include_system: bool = False,
     include_daemonsets: bool = False,
+    overrides=None,
     **kwargs,
 ):
-    """
-    Переместить поды с ноды node_name в пул target_pool.
-
-    Параметры:
-      - include_system=False: system-поды остаются на ноде;
-      - include_daemonsets=False: daemonset-поды остаются на ноде;
-      - оба по умолчанию False, т.е. по умолчанию переносим только workload-поды.
-
-    В любом случае после операции вызывается _cleanup_empty_nodes.
-    """
-    # Нормализуем имя пула, чтобы вылечить кривые значения вида
-    # "mpute.internal keda-nightly-al2023-private-c"
     target_pool = _normalize_pool_name(target_pool)
-
     all_pods_on_node = _collect_pods_by_node(snapshot, node_name)
-
     pod_ids = _filter_pods_for_move(
         snapshot,
         all_pods_on_node,
@@ -215,22 +259,26 @@ def move_node_pods_to_pool(
     )
 
     if not pod_ids:
-        # На ноде нет выбранных к переносу подов — возможно, она и так должна быть удалена
         _cleanup_empty_nodes(snapshot)
         return snapshot
+
+    if overrides:
+        snapshot = patch_pods_in_snapshot(
+            snapshot, pod_ids, 
+            req_cpu_m=overrides.req_cpu_m,
+            req_mem_b=overrides.req_mem_b,
+            tolerations=overrides.tolerations,
+            node_selector=overrides.node_selector,
+            affinity=overrides.affinity
+        )
 
     snapshot = move_pods_to_pool(snapshot, pod_ids, target_pool)
     _cleanup_empty_nodes(snapshot)
     return snapshot
 
 
-def move_namespace_to_pool(snapshot, namespace: str, target_pool: str):
-    """
-    Переместить все рабочие поды namespace в пул target_pool.
-    System/daemonset-поды не трогаем.
-    """
+def move_namespace_to_pool(snapshot, namespace: str, target_pool: str, overrides=None):
     target_pool = _normalize_pool_name(target_pool)
-
     all_ns_pods = _collect_pods_by_namespace(snapshot, namespace)
     pod_ids = _filter_workload_pods(snapshot, all_ns_pods)
 
@@ -238,24 +286,42 @@ def move_namespace_to_pool(snapshot, namespace: str, target_pool: str):
         _cleanup_empty_nodes(snapshot)
         return snapshot
 
+    if overrides:
+        snapshot = patch_pods_in_snapshot(
+            snapshot, pod_ids, 
+            req_cpu_m=overrides.req_cpu_m,
+            req_mem_b=overrides.req_mem_b,
+            tolerations=overrides.tolerations,
+            node_selector=overrides.node_selector,
+            affinity=overrides.affinity
+        )
+
     snapshot = move_pods_to_pool(snapshot, pod_ids, target_pool)
     _cleanup_empty_nodes(snapshot)
     return snapshot
 
 
-def move_owner_to_pool(snapshot, namespace: str, owner_name: str, target_pool: str):
+def move_owner_to_pool(snapshot, namespace: str, owner_name: str, target_pool: str, overrides=None):
     """
     Переместить все рабочие поды одного owner'а (deployment/statefulset) в пул target_pool.
-    System/daemonset-поды не трогаем.
     """
     target_pool = _normalize_pool_name(target_pool)
-
     all_owner_pods = _collect_pods_by_owner(snapshot, namespace, owner_name)
     pod_ids = _filter_workload_pods(snapshot, all_owner_pods)
 
     if not pod_ids:
         _cleanup_empty_nodes(snapshot)
         return snapshot
+
+    if overrides:
+        snapshot = patch_pods_in_snapshot(
+            snapshot, pod_ids, 
+            req_cpu_m=overrides.req_cpu_m,
+            req_mem_b=overrides.req_mem_b,
+            tolerations=overrides.tolerations,
+            node_selector=overrides.node_selector,
+            affinity=overrides.affinity
+        )
 
     snapshot = move_pods_to_pool(snapshot, pod_ids, target_pool)
     _cleanup_empty_nodes(snapshot)
@@ -268,9 +334,6 @@ def move_owner_to_pool(snapshot, namespace: str, owner_name: str, target_pool: s
 
 
 def delete_pods(snapshot, pod_ids: Sequence[str]):
-    """
-    Удалить конкретные поды (по pod_id) из снапшота, затем подчистить пустые ноды.
-    """
     pods = getattr(snapshot, "pods", {})
     for pod_id in pod_ids:
         pods.pop(pod_id, None)
@@ -280,9 +343,6 @@ def delete_pods(snapshot, pod_ids: Sequence[str]):
 
 
 def delete_namespace(snapshot, namespace: str):
-    """
-    Удалить все поды namespace, затем подчистить пустые ноды.
-    """
     pods = getattr(snapshot, "pods", {})
     to_delete: List[str] = []
     for pod_id, pod in pods.items():
@@ -297,9 +357,6 @@ def delete_namespace(snapshot, namespace: str):
 
 
 def delete_owner(snapshot, namespace: str, owner_name: str):
-    """
-    Удалить все поды owner'а (deployment/statefulset) в namespace, затем подчистить пустые ноды.
-    """
     pods = getattr(snapshot, "pods", {})
     to_delete: List[str] = []
     for pod_id, pod in pods.items():

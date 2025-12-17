@@ -134,9 +134,6 @@
       border: 1px solid rgba(231, 76, 60, 0.4);
       background: linear-gradient(180deg, rgba(231, 76, 60, 0.05), rgba(10, 16, 32, 0.95));
     }
-    .viol-card .hdr {
-      border-bottom: 1px solid rgba(231, 76, 60, 0.2);
-    }
     .viol-list {
       max-height: 220px;
       overflow-y: auto;
@@ -176,8 +173,6 @@
       font-family: var(--sans);
     }
     .viol-list::-webkit-scrollbar { width: 6px; }
-    .viol-list::-webkit-scrollbar-track { background: rgba(0,0,0,0.2); }
-    .viol-list::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
 
     table{border-collapse:collapse; width:100%}
     th,td{padding:9px 10px; border-bottom:1px solid rgba(255,255,255,.06); font-size:12.5px; vertical-align:top}
@@ -316,6 +311,59 @@
     .drag:active{cursor:grabbing}
     .droptarget{outline:2px dashed rgba(46,204,113,.55); outline-offset:-2px}
 
+    /* Modal Styles */
+    .modal-overlay {
+        position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+        background: rgba(0,0,0,0.7);
+        backdrop-filter: blur(4px);
+        display: none; align-items: center; justify-content: center;
+        z-index: 100;
+    }
+    .modal {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        width: 600px;
+        max-width: 90%;
+        box-shadow: var(--shadow);
+        display: flex; flex-direction: column;
+    }
+    .modal-hdr {
+        padding: 16px 20px;
+        border-bottom: 1px solid var(--border);
+        font-weight: 800; font-size: 16px;
+        display: flex; justify-content: space-between; align-items: center;
+    }
+    .modal-body {
+        padding: 20px;
+        display: flex; flex-direction: column; gap: 16px;
+        max-height: 70vh; overflow-y: auto;
+    }
+    .modal-ftr {
+        padding: 16px 20px;
+        border-top: 1px solid var(--border);
+        background: rgba(255,255,255,0.02);
+        display: flex; justify-content: flex-end; gap: 10px;
+    }
+    .form-group { display: flex; flex-direction: column; gap: 6px; }
+    .form-group label { font-size: 12px; font-weight: 700; color: var(--muted); }
+    .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .inp {
+        background: rgba(0,0,0,0.3); border: 1px solid var(--border);
+        color: var(--text); padding: 8px 10px; border-radius: 6px;
+        font-family: var(--mono); font-size: 13px;
+    }
+    .inp:focus { outline: none; border-color: #3498db; }
+    textarea.inp { min-height: 80px; resize: vertical; }
+    
+    .chk-group {
+        display: flex; align-items: center; gap: 10px;
+        padding: 10px; border: 1px solid rgba(52,152,219,0.3);
+        background: rgba(52,152,219,0.05); border-radius: 8px;
+    }
+    .chk-group input { width: 16px; height: 16px; cursor: pointer; }
+    .chk-group span { font-size: 13px; font-weight: 600; }
+
     @media (max-width: 1200px){
       body{overflow:auto}
       .wrap{height:auto}
@@ -397,7 +445,7 @@
               <tbody id="nodesBody"></tbody>
             </table>
           </div>
-          <div class="drop-hint">Перетащите pod из правой таблицы на строку ноды слева — перенос произойдёт <b>в nodepool</b> выбранной ноды.</div>
+          <div class="drop-hint">Перетащите pod из правой таблицы на строку ноды слева — откроется окно настройки переноса.</div>
         </div>
       </div>
 
@@ -432,6 +480,55 @@
     </div>
   </div>
 
+  <div class="modal-overlay" id="moveModalOverlay">
+    <div class="modal">
+        <div class="modal-hdr">
+            <span>Настройка переноса Pod</span>
+            <span style="cursor:pointer" onclick="closeModal()">✕</span>
+        </div>
+        <div class="modal-body">
+            <div style="font-size:13px; color:var(--text); margin-bottom:5px;">
+                Перенос пода <strong id="mPodId" class="mono">...</strong><br>
+                На ноду (Pool): <strong id="mTargetNode" class="mono">...</strong>
+            </div>
+
+            <div class="chk-group" id="mOwnerGroup">
+                <input type="checkbox" id="mCheckOwner">
+                <span>Перенести весь <span id="mOwnerKind">Deployment</span> <b><span id="mOwnerName">...</span></b>?</span>
+            </div>
+
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Requests CPU (m)</label>
+                    <input class="inp" type="number" id="mCpu">
+                </div>
+                <div class="form-group">
+                    <label>Requests Memory (Bytes)</label>
+                    <input class="inp" type="number" id="mMem">
+                </div>
+            </div>
+
+            <div class="form-group">
+                <label>Node Selector (JSON)</label>
+                <textarea class="inp" id="mSelector"></textarea>
+            </div>
+            
+            <div class="form-group">
+                <label>Tolerations (JSON)</label>
+                <textarea class="inp" id="mTolerations"></textarea>
+            </div>
+            
+            <div style="font-size:11px; color:var(--muted)">
+                * Поля Selector и Tolerations автоматически предзаполнены для совместимости с целевым NodePool.
+            </div>
+        </div>
+        <div class="modal-ftr">
+            <button class="btn" onclick="closeModal()">Отмена</button>
+            <button class="btn blue" onclick="commitMove()">Применить и перенести</button>
+        </div>
+    </div>
+  </div>
+
 <script>
   const state = {
     sim: null,
@@ -439,6 +536,7 @@
     selectedNode: null,
     sortKey: "gfw",
     sortDir: "desc",
+    pendingMove: null // { podId, targetNode, planData }
   };
 
   function fmtUsd(x){
@@ -536,7 +634,6 @@
           const res = await apiPost("/snapshots/capture");
           await loadSnapshotsList();
           
-          // Switch to new
           el("selSnapshots").value = res.id;
           await apiPost(`/snapshots/${res.id}/activate`);
           
@@ -548,6 +645,107 @@
           setBusy(false);
       }
   });
+
+  // --- Modal Logic ---
+  
+  function openModal(podId, targetNode, plan) {
+      state.pendingMove = { podId, targetNode, plan };
+      
+      el("mPodId").textContent = podId;
+      el("mTargetNode").textContent = targetNode;
+      
+      // Setup Owner Checkbox
+      if (plan.owner_name && plan.owner_kind) {
+          el("mOwnerGroup").style.display = "flex";
+          el("mCheckOwner").checked = false;
+          el("mOwnerKind").textContent = plan.owner_kind;
+          el("mOwnerName").textContent = plan.owner_name;
+      } else {
+          el("mOwnerGroup").style.display = "none";
+      }
+
+      // Pre-fill Inputs
+      el("mCpu").value = plan.current_req_cpu_m;
+      el("mMem").value = plan.current_req_mem_b;
+      
+      el("mTolerations").value = JSON.stringify(plan.suggested_tolerations, null, 2);
+      el("mSelector").value = JSON.stringify(plan.suggested_node_selector, null, 2);
+      
+      el("moveModalOverlay").style.display = "flex";
+  }
+  
+  function closeModal() {
+      el("moveModalOverlay").style.display = "none";
+      state.pendingMove = null;
+  }
+  
+  async function commitMove() {
+      if (!state.pendingMove) return;
+      
+      const { podId, targetNode, plan } = state.pendingMove;
+      const isOwner = el("mCheckOwner").checked;
+      
+      let req_cpu, req_mem, tols, sel;
+      try {
+          req_cpu = parseInt(el("mCpu").value);
+          req_mem = parseInt(el("mMem").value);
+          tols = JSON.parse(el("mTolerations").value);
+          sel = JSON.parse(el("mSelector").value);
+      } catch(e) {
+          alert("Ошибка парсинга JSON или чисел: " + e.message);
+          return;
+      }
+
+      const overrides = {
+          req_cpu_m: req_cpu,
+          req_mem_b: req_mem,
+          tolerations: tols,
+          node_selector: sel
+      };
+      
+      // Находим NodePool целевой ноды
+      // Нам нужен target_pool для операции. Мы можем взять его из state.nodes
+      const targetNodeObj = state.nodes.find(n => n.node === targetNode);
+      if (!targetNodeObj || !targetNodeObj.nodepool) {
+          alert("Целевая нода не имеет пула!");
+          return;
+      }
+      const targetPool = targetNodeObj.nodepool;
+
+      let op = {};
+      if (isOwner && plan.owner_name) {
+          op = {
+              op: "move_owner_to_pool",
+              namespace: podId.split("/")[0], // Грубо, но работает (namespace/name)
+              owner_kind: plan.owner_kind,
+              owner_name: plan.owner_name,
+              target_pool: targetPool,
+              overrides: overrides
+          };
+      } else {
+          op = {
+              op: "move_pods_to_pool",
+              pod_ids: [podId],
+              target_pool: targetPool,
+              overrides: overrides
+          };
+      }
+      
+      closeModal();
+      setBusy(true);
+      setMsg("Выполняется перенос...");
+      
+      try {
+          await apiMutateOne(op);
+          await loadSim();
+          setMsg("Успешно перенесено!");
+      } catch(e) {
+          setMsg("Ошибка переноса: " + e.message, true);
+      } finally {
+          setBusy(false);
+      }
+  }
+
 
   // --- Render logic ---
 
@@ -633,23 +831,19 @@
     card.style.display = "block";
     el("violCount").textContent = String(keys.length);
 
-    // Сортируем: сначала те, где больше ошибок
     keys.sort((a,b) => v[b].length - v[a].length);
 
-    // Показываем первые 100, чтобы не грузить DOM
     for (const podId of keys.slice(0, 100)){
       const reasons = v[podId] || [];
       
       const item = document.createElement("div");
       item.className = "viol-item";
       
-      // Pod Name
       const nameDiv = document.createElement("div");
       nameDiv.className = "viol-pod";
       nameDiv.textContent = podId;
       nameDiv.title = podId;
       
-      // Messages
       const msgsDiv = document.createElement("div");
       msgsDiv.className = "viol-msgs";
       
@@ -691,7 +885,6 @@
         tr.classList.add("selected");
       }
 
-      // droptarget
       tr.addEventListener("dragover", (e)=>{
         e.preventDefault();
         tr.classList.add("droptarget");
@@ -699,27 +892,26 @@
       tr.addEventListener("dragleave", ()=>{
         tr.classList.remove("droptarget");
       });
+      
+      // DROP HANDLER (Updated)
       tr.addEventListener("drop", async (e)=>{
         e.preventDefault();
         tr.classList.remove("droptarget");
+        
         const podId = e.dataTransfer.getData("text/plain");
         if (!podId) return;
-        const targetPool = n.nodepool || "";
-        if (!targetPool){
-          setMsg("У ноды нет nodepool — перенос в пул невозможен", true);
-          return;
-        }
-        try{
-          setMsg("Переношу pod в nodepool " + targetPool + " …");
-          await apiMutateOne({op:"move_pods_to_pool", pod_ids:[podId], target_pool: targetPool});
-          await loadSim();
-          setMsg("OK: pod перемещён в pool " + targetPool);
-        }catch(err){
-          setMsg("Ошибка при переносе: " + (err?.message || err), true);
+        
+        // Вместо прямого вызова mutate, запрашиваем план
+        try {
+            setMsg("Анализ переноса...");
+            const plan = await apiPost("/plan_move", { pod_id: podId, target_node: n.node });
+            openModal(podId, n.node, plan);
+            setMsg("Настройте параметры переноса.");
+        } catch(err) {
+            setMsg("Ошибка планирования: " + err.message, true);
         }
       });
 
-      // click selection (anywhere in row)
       tr.addEventListener("click", ()=>{
         state.selectedNode = n.node;
         renderNodes();
@@ -745,7 +937,6 @@
       tdCost.className = "right mono";
       tdCost.textContent = fmtUsd(n.cost_daily_usd);
 
-      // CPU cell
       const tdCpu = document.createElement("td");
       const mCpu = document.createElement("div");
       mCpu.className = "metric";
@@ -762,7 +953,6 @@
       mCpu.appendChild(buildBar(nodeCpuParts(n), Math.max(1, n.alloc_cpu_m||1)));
       tdCpu.appendChild(mCpu);
 
-      // RAM cell
       const tdRam = document.createElement("td");
       const mRam = document.createElement("div");
       mRam.className = "metric";
@@ -789,7 +979,6 @@
       tb.appendChild(tr);
     }
 
-    // attach sort handlers (once)
     const headers = document.querySelectorAll("th[data-sort]");
     headers.forEach(h=>{
       if (h.dataset.bound) return;
@@ -891,7 +1080,6 @@
       state.sim = sim;
       state.nodes = (sim.nodes || []).slice();
 
-      // default selection: first node or keep selection
       if (!state.selectedNode){
         state.selectedNode = state.nodes.length ? state.nodes[0].node : null;
       }else{
@@ -904,7 +1092,7 @@
       renderViolations(sim);
       renderNodes();
       renderPods();
-      setMsg("Готово. Перетащите pod на ноду для перемещения в её nodepool.");
+      setMsg("Готово. Перетащите pod на ноду для настройки переноса.");
     }catch(err){
       setMsg("Ошибка загрузки /simulate: " + (err?.message || err), true);
     }finally{
@@ -912,7 +1100,6 @@
     }
   }
 
-  // Buttons
   el("btnRefresh").addEventListener("click", ()=>loadSim());
   el("btnReset").addEventListener("click", async ()=>{
     try{
@@ -941,7 +1128,6 @@
     }
   });
 
-  // init
   loadSnapshotsList().then(loadSim);
 </script>
 </body>
