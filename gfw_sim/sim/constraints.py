@@ -70,36 +70,53 @@ def _taint_tolerated(
     key: str | None, value: str | None, effect: str | None, tolerations: List[Dict[str, Any]]
 ) -> bool:
     """
-    Грубая модель соответствия taint/toleration:
-      - оператор Equal (дефолт): key совпадает, value совпадает (или taint.value пустой),
-        effect совпадает или в toleration не задан;
-      - оператор Exists: key совпадает, effect совпадает или не задан.
+    Проверяет, перекрывается ли конкретный taint одной из tolerations.
+    
+    Логика (согласно K8s docs):
+      1. Если key пустое (None) и operator "Exists" -> матчит все ключи/values/effects.
+      2. Если key совпадает:
+         - operator "Exists" -> матчит любой value.
+         - operator "Equal" (дефолт) -> value должно совпадать.
+      3. Effect должен совпадать (если в toleration он задан).
     """
     for tol in tolerations:
         t_key = tol.get("key")
-        if not t_key or t_key != key:
-            continue
-
         op = (tol.get("operator") or "Equal").capitalize()
         t_val = tol.get("value")
         t_eff = tol.get("effect")
 
+        # 1. Проверка Effect
+        # Если effect в toleration задан, он должен строго совпадать.
+        # Если effect в toleration пуст (None/empty), он "tolerates all effects".
         if t_eff and effect and t_eff != effect:
             continue
 
+        # 2. Проверка Key (и обработка Wildcard)
+        if t_key is None:
+            # Специфический случай K8s: если key не указан, operator должен быть Exists.
+            # Это означает, что toleration матчит любой taint key.
+            if op == "Exists":
+                return True
+            else:
+                # Некорректная конфигурация K8s (Empty key + Equal), пропускаем
+                continue
+        
+        # Если key указан явно, он должен совпадать с ключом taint
+        if t_key != key:
+            continue
+
+        # 3. Проверка Value (при совпадении ключа)
         if op == "Exists":
             return True
 
-        # Equal / всё остальное трактуем как Equal
         if op == "Equal":
-            if value is None:
-                # taint без value, достаточно совпадения key
-                return True
+            # Value должно совпадать
+            # Используем строковое сравнение для надежности
+            v1 = str(t_val) if t_val is not None else ""
+            v2 = str(value) if value is not None else ""
             
-            # --- FIX: Robust comparison (str/bool/case-insensitive) ---
-            v1 = str(t_val).lower() if t_val is not None else ""
-            v2 = str(value).lower() if value is not None else ""
-            
+            # В K8s значения case-sensitive, но для надежности сравнения в симуляции
+            # можно оставить точное совпадение v1 == v2.
             if v1 == v2:
                 return True
 
@@ -176,7 +193,6 @@ def _match_node_selector_expression(expr: Dict[str, Any], labels: Dict[str, str]
     if op == "DoesNotExist":
         return key not in labels
     if op in ("Gt", "Lt"):
-        # очень грубо: сравниваем как int, если не получилось — считаем несовпадением
         try:
             v_int = int(val) if val is not None else None
             cmp = int(values[0]) if values else None
@@ -189,16 +205,11 @@ def _match_node_selector_expression(expr: Dict[str, Any], labels: Dict[str, str]
         else:
             return v_int < cmp
 
-    # неизвестный оператор — считаем, что не удовлетворяет
     return False
 
 
 def _match_node_selector_term(term: Dict[str, Any], labels: Dict[str, str]) -> bool:
-    """
-    NodeSelectorTerm: набор выражений AND в рамках терма, термы объединяются по OR.
-    """
     exprs = term.get("matchExpressions") or []
-    # matchFields игнорируем, чтобы не усложнять — редко используется для наших кейсов
     for expr in exprs:
         if not _match_node_selector_expression(expr, labels):
             return False
@@ -236,9 +247,6 @@ def check_pod_on_node(pod, node) -> List[str]:
       - nodeSelector
       - taints / tolerations
       - nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution
-
-    podAffinity / podAntiAffinity здесь сознательно не проверяем, т.к. нужен
-    полноценный контекст по другим подам и селекторам; можно будет добавить позже.
     """
     reasons: List[str] = []
 
@@ -267,8 +275,6 @@ def compute_violations(snapshot) -> Dict[str, List[Dict[str, Any]]]:
         ],
         ...
       }
-
-    Используется на уровне API для поля `violations` в /simulate.
     """
     nodes = getattr(snapshot, "nodes", None) or {}
     pods = getattr(snapshot, "pods", None) or {}
@@ -279,6 +285,7 @@ def compute_violations(snapshot) -> Dict[str, List[Dict[str, Any]]]:
         node_violations: List[Dict[str, Any]] = []
 
         for pod_id, pod in pods.items():
+            # Проверяем только поды, назначенные на эту ноду
             if getattr(pod, "node", None) != node_name:
                 continue
 
@@ -303,10 +310,4 @@ def compute_violations(snapshot) -> Dict[str, List[Dict[str, Any]]]:
 
 
 def check_all_placements(snapshot) -> Dict[str, List[Dict[str, Any]]]:
-    """
-    Обратная совместимость для старого API constraints.check_all_placements().
-
-    Возвращает тот же формат, что и compute_violations(snapshot):
-      dict[node_name] = [{pod_id, reasons}, ...]
-    """
     return compute_violations(snapshot)
