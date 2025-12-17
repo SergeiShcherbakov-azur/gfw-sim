@@ -1,0 +1,812 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>GFW Node & Cost Simulator</title>
+  <style>
+    :root{
+      --bg0:#05070b;
+      --bg1:#0a1020;
+      --card:#0b1222;
+      --card2:#0a1226;
+      --border:rgba(255,255,255,.08);
+      --muted:rgba(255,255,255,.65);
+      --text:rgba(255,255,255,.92);
+
+      --seg-gfw:#1f77b4;
+      --seg-ds:#ff7f0e;
+      --seg-oth:#2ca02c;
+      --seg-free:rgba(255,255,255,.16);
+
+      --good:#2ecc71;
+      --warn:#f1c40f;
+      --bad:#e74c3c;
+
+      --shadow: 0 20px 60px rgba(0,0,0,.45);
+      --radius:18px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      --sans: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+    }
+    html,body{height:100%}
+    body{
+      margin:0;
+      background: radial-gradient(1200px 900px at 20% -10%, rgba(0,140,255,.22), transparent 60%),
+                  radial-gradient(900px 700px at 90% 10%, rgba(0,255,140,.14), transparent 55%),
+                  linear-gradient(180deg, var(--bg0), var(--bg1));
+      color:var(--text);
+      font-family:var(--sans);
+      overflow:hidden; /* основной скролл у внутренних панелей */
+    }
+
+    .topbar{
+      position:sticky; top:0; z-index:50;
+      display:flex; align-items:center; justify-content:space-between;
+      padding:14px 18px;
+      background: linear-gradient(180deg, rgba(5,7,11,.92), rgba(5,7,11,.55));
+      border-bottom:1px solid var(--border);
+      backdrop-filter: blur(10px);
+    }
+    .title{
+      font-size:18px; font-weight:800; letter-spacing:.2px;
+    }
+    .actions{display:flex; gap:10px; align-items:center; flex-wrap:wrap;}
+    .btn{
+      border:1px solid var(--border);
+      background:rgba(255,255,255,.06);
+      color:var(--text);
+      padding:9px 12px;
+      border-radius:999px;
+      cursor:pointer;
+      font-weight:700;
+      font-size:13px;
+      transition: transform .04s ease, background .12s ease, border-color .12s ease;
+      user-select:none;
+    }
+    .btn:hover{background:rgba(255,255,255,.10)}
+    .btn:active{transform:scale(.98)}
+    .btn.green{background: rgba(46, 204, 113, .18); border-color: rgba(46,204,113,.35)}
+    .btn.red{background: rgba(231, 76, 60, .18); border-color: rgba(231,76,60,.35)}
+    .btn.blue{background: rgba(52,152,219,.18); border-color: rgba(52,152,219,.35)}
+    .btn:disabled{opacity:.5; cursor:not-allowed}
+
+    .wrap{
+      height: calc(100vh - 54px);
+      display:flex;
+      flex-direction:column;
+      gap:12px;
+      padding:12px 14px 14px 14px;
+    }
+
+    .summary{
+      display:grid;
+      grid-template-columns: repeat(3, minmax(220px, 1fr));
+      gap:12px;
+    }
+    .card{
+      background: linear-gradient(180deg, rgba(12,18,34,.82), rgba(8,12,22,.82));
+      border:1px solid var(--border);
+      border-radius:var(--radius);
+      box-shadow: var(--shadow);
+      overflow:hidden;
+    }
+    .card .hdr{
+      padding:12px 14px 10px 14px;
+      border-bottom:1px solid var(--border);
+      display:flex; align-items:center; justify-content:space-between;
+      gap:10px;
+    }
+    .card .hdr h3{
+      margin:0;
+      font-size:13px;
+      letter-spacing:.2px;
+      color:rgba(255,255,255,.86);
+      font-weight:800;
+      text-transform:uppercase;
+    }
+    .card .body{padding:12px 14px}
+    .big{
+      font-size:22px;
+      font-weight:900;
+      letter-spacing:.3px;
+    }
+    .muted{color:var(--muted); font-size:12px}
+    .pill{
+      font-size:12px;
+      padding:4px 9px;
+      border-radius:999px;
+      border:1px solid var(--border);
+      background:rgba(255,255,255,.06);
+      color:rgba(255,255,255,.88);
+      white-space:nowrap;
+    }
+
+    .viol-card{display:none}
+    .viol-table-wrap{max-height:160px; overflow:auto}
+    table{border-collapse:collapse; width:100%}
+    th,td{padding:9px 10px; border-bottom:1px solid rgba(255,255,255,.06); font-size:12.5px; vertical-align:top}
+    th{
+      position:sticky; top:0; z-index:2;
+      background: linear-gradient(180deg, rgba(14,20,38,.92), rgba(10,16,28,.92));
+      backdrop-filter: blur(10px);
+      text-align:left;
+      font-size:12px;
+      letter-spacing:.2px;
+      color:rgba(255,255,255,.82);
+      font-weight:800;
+      cursor:pointer;
+      user-select:none;
+      white-space:nowrap;
+    }
+    th.nosort{cursor:default}
+    tbody tr:hover{background:rgba(255,255,255,.04)}
+    tbody tr.selected{background:rgba(52,152,219,.16)}
+    .mono{font-family:var(--mono)}
+    .right{text-align:right}
+    .center{text-align:center}
+
+    .grid{
+      flex: 1 1 auto;
+      min-height: 0; /* важно для flex+overflow */
+      display:grid;
+      grid-template-columns: minmax(520px, 1.25fr) minmax(420px, 1fr);
+      gap:12px;
+    }
+
+    .panel{
+      display:flex;
+      flex-direction:column;
+      min-height:0;
+    }
+    .panel .body{
+      padding:0;
+      flex:1 1 auto;
+      min-height:0;
+      display:flex;
+      flex-direction:column;
+    }
+
+    .table-wrap{
+      flex:1 1 auto;
+      min-height:0;
+      overflow:auto;
+    }
+
+    /* Узкие ячейки и переносы */
+    .col-node{min-width:340px}
+    .node-name{
+      font-weight:800;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      max-width: 520px;
+      display:block;
+    }
+    .nodepool{
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      max-width:260px;
+      display:block;
+      color:rgba(255,255,255,.85);
+    }
+
+    .metric{
+      display:flex;
+      flex-direction:column;
+      gap:6px;
+      min-width:220px;
+    }
+    .metric .topline{
+      display:flex;
+      justify-content:space-between;
+      gap:10px;
+      white-space:nowrap;
+    }
+    .metric .topline .label{color:rgba(255,255,255,.75); font-weight:700; font-size:12px}
+    .metric .topline .val{font-family:var(--mono); font-weight:800; font-size:12px}
+    .bar{
+      height:9px;
+      border-radius:999px;
+      overflow:hidden;
+      border:1px solid rgba(255,255,255,.10);
+      background:rgba(255,255,255,.06);
+      display:flex;
+    }
+    .seg{height:100%}
+    .seg.gfw{background:var(--seg-gfw)}
+    .seg.ds{background:var(--seg-ds)}
+    .seg.oth{background:var(--seg-oth)}
+    .seg.free{background:var(--seg-free)}
+
+    .drop-hint{
+      font-size:12px;
+      color:rgba(255,255,255,.65);
+      padding:10px 14px;
+      border-top:1px solid rgba(255,255,255,.06);
+      background:rgba(255,255,255,.02);
+    }
+
+    .pods-title{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
+      font-size:12px;
+      color:rgba(255,255,255,.72);
+    }
+    .pods-title strong{color:rgba(255,255,255,.92)}
+    .msg{
+      padding:10px 14px;
+      border-top:1px solid rgba(255,255,255,.06);
+      font-size:12.5px;
+      color:rgba(255,255,255,.80);
+      background:rgba(255,255,255,.02);
+      min-height:20px;
+    }
+    .msg.err{color:#ffb3b3}
+    .tag{
+      display:inline-block;
+      padding:2px 8px;
+      border-radius:999px;
+      border:1px solid rgba(255,255,255,.10);
+      background:rgba(255,255,255,.05);
+      font-size:11px;
+      margin-left:6px;
+      white-space:nowrap;
+    }
+    .tag.sys{border-color:rgba(52,152,219,.35); background:rgba(52,152,219,.10)}
+    .tag.ds{border-color:rgba(241,196,15,.35); background:rgba(241,196,15,.10)}
+    .drag{cursor:grab}
+    .drag:active{cursor:grabbing}
+    .droptarget{outline:2px dashed rgba(46,204,113,.55); outline-offset:-2px}
+
+    @media (max-width: 1200px){
+      body{overflow:auto}
+      .wrap{height:auto}
+      .grid{grid-template-columns:1fr}
+    }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="title">GFW Node & Cost Simulator</div>
+    <div class="actions">
+      <button class="btn blue" id="btnRefresh">Обновить</button>
+      <button class="btn red" id="btnReset">Сбросить к baseline</button>
+      <button class="btn green" id="btnRefreshPrices">Обновить прайсы из AWS</button>
+    </div>
+  </div>
+
+  <div class="wrap">
+    <div class="summary">
+      <div class="card">
+        <div class="hdr"><h3>Все ноды, $/день</h3><span class="pill" id="pillLoaded">…</span></div>
+        <div class="body">
+          <div class="big" id="sumAll">0.00</div>
+          <div class="muted">Стоимость всех нод кластера</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="hdr"><h3>Ноды с GFW, $/день</h3><span class="pill">GFW</span></div>
+        <div class="body">
+          <div class="big" id="sumGfw">0.00</div>
+          <div class="muted">Подмножество нод, где есть GFW-поды</div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="hdr"><h3>KEDA-Nightly, $/день</h3><span class="pill">schedule</span></div>
+        <div class="body">
+          <div class="big" id="sumKeda">0.00</div>
+          <div class="muted">С учётом расписания пула (будни 08:00–20:00, без выходных)</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card viol-card" id="violCard">
+      <div class="hdr"><h3>Нарушения правил (после перемещений)</h3><span class="pill" id="violCount">0</span></div>
+      <div class="body">
+        <div class="viol-table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th class="nosort">Pod</th>
+                <th class="nosort">Violations</th>
+              </tr>
+            </thead>
+            <tbody id="violBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid">
+      <div class="card panel">
+        <div class="hdr">
+          <h3>Ноды</h3>
+          <div class="pods-title"><span class="pill" id="nodesCount">0</span></div>
+        </div>
+        <div class="body">
+          <div class="table-wrap" id="nodesWrap">
+            <table>
+              <thead>
+                <tr>
+                  <th data-sort="node" class="col-node">Нода</th>
+                  <th data-sort="nodepool">Nodepool</th>
+                  <th data-sort="cost" class="right">$/день</th>
+                  <th data-sort="cpu">CPU (alloc / req)</th>
+                  <th data-sort="ram">RAM (alloc / req)</th>
+                </tr>
+              </thead>
+              <tbody id="nodesBody"></tbody>
+            </table>
+          </div>
+          <div class="drop-hint">Перетащите pod из правой таблицы на строку ноды слева — перенос произойдёт <b>в nodepool</b> выбранной ноды.</div>
+        </div>
+      </div>
+
+      <div class="card panel">
+        <div class="hdr">
+          <h3>Поды на выбранной ноде</h3>
+          <div class="pods-title">
+            <span>Нода: <strong id="selNode">—</strong></span>
+            <span class="pill" id="podsCount">0</span>
+          </div>
+        </div>
+        <div class="body">
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th class="nosort">Namespace</th>
+                  <th class="nosort">Pod</th>
+                  <th class="nosort">Owner</th>
+                  <th class="nosort">Type</th>
+                  <th class="nosort right">CPU (m)</th>
+                  <th class="nosort right">RAM (MiB)</th>
+                  <th class="nosort">Flags</th>
+                </tr>
+              </thead>
+              <tbody id="podsBody"></tbody>
+            </table>
+          </div>
+          <div class="msg" id="msg">Drag pod → drop on node to move it.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const state = {
+    sim: null,
+    nodes: [],
+    selectedNode: null,
+    sortKey: "gfw",
+    sortDir: "desc",
+  };
+
+  function fmtUsd(x){
+    if (x === null || x === undefined || isNaN(x)) return "0.00";
+    return Number(x).toFixed(4);
+  }
+  function fmtMiB(bytes){
+    if (!bytes) return "0";
+    return (bytes / (1024*1024)).toFixed(0);
+  }
+  function clampPct(x){
+    if (!isFinite(x)) return 0;
+    return Math.max(0, Math.min(100, x));
+  }
+  function el(id){ return document.getElementById(id); }
+
+  async function apiGetSim(){
+    const r = await fetch("/simulate");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return await r.json();
+  }
+  async function apiPost(url, body){
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {"Content-Type":"application/json"},
+      body: body ? JSON.stringify(body) : "{}",
+    });
+    const txt = await r.text();
+    if (!r.ok){
+      throw new Error(url + " → HTTP " + r.status + ": " + (txt || ""));
+    }
+    return txt ? JSON.parse(txt) : {};
+  }
+  async function apiMutateOne(op){
+    // Отправляем в стабильной форме MutateRequest
+    return await apiPost("/mutate", {operations:[op]});
+  }
+
+  function setBusy(b){
+    el("btnRefresh").disabled = b;
+    el("btnReset").disabled = b;
+    el("btnRefreshPrices").disabled = b;
+    el("pillLoaded").textContent = b ? "loading…" : "ok";
+  }
+  function setMsg(text, isErr=false){
+    const m = el("msg");
+    m.textContent = text;
+    m.className = "msg" + (isErr ? " err" : "");
+  }
+
+  function buildBar(parts, allocTotal){
+    const gfw = parts?.gfw ?? 0;
+    const ds  = parts?.ds ?? 0;
+    const oth = parts?.oth ?? 0;
+    const used = Math.max(0, gfw + ds + oth);
+    const free = Math.max(0, allocTotal - used);
+    const denom = Math.max(1, allocTotal);
+
+    const wG = clampPct(100 * gfw / denom);
+    const wD = clampPct(100 * ds  / denom);
+    const wO = clampPct(100 * oth / denom);
+    const wF = clampPct(100 * free/ denom);
+
+    const bar = document.createElement("div");
+    bar.className = "bar";
+    const mk = (cls,w)=>{
+      const s = document.createElement("div");
+      s.className = "seg " + cls;
+      s.style.width = w.toFixed(3) + "%";
+      return s;
+    };
+    bar.appendChild(mk("gfw", wG));
+    bar.appendChild(mk("ds", wD));
+    bar.appendChild(mk("oth", wO));
+    bar.appendChild(mk("free", wF));
+    return bar;
+  }
+
+  function nodeCpuParts(n){
+    return {
+      gfw: n.parts?.gfw_cpu_m ?? 0,
+      ds:  n.parts?.ds_cpu_m ?? 0,
+      oth: n.parts?.other_cpu_m ?? 0
+    };
+  }
+  function nodeMemPartsMiB(n){
+    return {
+      gfw: (n.parts?.gfw_mem_b ?? 0) / (1024*1024),
+      ds:  (n.parts?.ds_mem_b ?? 0) / (1024*1024),
+      oth: (n.parts?.other_mem_b ?? 0) / (1024*1024),
+    };
+  }
+
+  function sortNodes(){
+    const key = state.sortKey;
+    const dir = state.sortDir === "asc" ? 1 : -1;
+
+    const val = (n)=>{
+      if (key === "node") return n.node || "";
+      if (key === "nodepool") return n.nodepool || "";
+      if (key === "cost") return n.cost_daily_usd || 0;
+      if (key === "cpu") return (n.sum_req_cpu_m || 0) / Math.max(1, n.alloc_cpu_m || 1);
+      if (key === "ram") return (n.sum_req_mem_b || 0) / Math.max(1, n.alloc_mem_b || 1);
+      if (key === "gfw") return n.gfw_ratio_pct || 0;
+      return 0;
+    };
+
+    state.nodes.sort((a,b)=>{
+      const va = val(a), vb = val(b);
+      if (typeof va === "string" || typeof vb === "string"){
+        return String(va).localeCompare(String(vb)) * dir;
+      }
+      return (va - vb) * dir;
+    });
+  }
+
+  function renderViolations(sim){
+    const v = sim.violations || {};
+    const keys = Object.keys(v);
+    const card = el("violCard");
+    const body = el("violBody");
+    body.innerHTML = "";
+    if (!keys.length){
+      card.style.display = "none";
+      return;
+    }
+    card.style.display = "block";
+    el("violCount").textContent = String(keys.length);
+
+    for (const podId of keys.slice(0, 200)){
+      const tr = document.createElement("tr");
+      const td1 = document.createElement("td");
+      td1.className = "mono";
+      td1.textContent = podId;
+      const td2 = document.createElement("td");
+      td2.textContent = (v[podId] || []).join("; ");
+      tr.appendChild(td1);
+      tr.appendChild(td2);
+      body.appendChild(tr);
+    }
+    if (keys.length > 200){
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      td.colSpan = 2;
+      td.className = "muted";
+      td.textContent = "Показаны первые 200 нарушений…";
+      tr.appendChild(td);
+      body.appendChild(tr);
+    }
+  }
+
+  function renderNodes(){
+    const tb = el("nodesBody");
+    tb.innerHTML = "";
+
+    sortNodes();
+    el("nodesCount").textContent = String(state.nodes.length);
+
+    for (const n of state.nodes){
+      const tr = document.createElement("tr");
+      tr.dataset.node = n.node;
+
+      if (state.selectedNode && n.node === state.selectedNode){
+        tr.classList.add("selected");
+      }
+
+      // droptarget
+      tr.addEventListener("dragover", (e)=>{
+        e.preventDefault();
+        tr.classList.add("droptarget");
+      });
+      tr.addEventListener("dragleave", ()=>{
+        tr.classList.remove("droptarget");
+      });
+      tr.addEventListener("drop", async (e)=>{
+        e.preventDefault();
+        tr.classList.remove("droptarget");
+        const podId = e.dataTransfer.getData("text/plain");
+        if (!podId) return;
+        const targetPool = n.nodepool || "";
+        if (!targetPool){
+          setMsg("У ноды нет nodepool — перенос в пул невозможен", true);
+          return;
+        }
+        try{
+          setMsg("Переношу pod в nodepool " + targetPool + " …");
+          await apiMutateOne({op:"move_pods_to_pool", pod_ids:[podId], target_pool: targetPool});
+          await loadSim();
+          setMsg("OK: pod перемещён в pool " + targetPool);
+        }catch(err){
+          setMsg("Ошибка при переносе: " + (err?.message || err), true);
+        }
+      });
+
+      // click selection (anywhere in row)
+      tr.addEventListener("click", ()=>{
+        state.selectedNode = n.node;
+        renderNodes();
+        renderPods();
+      });
+
+      const tdNode = document.createElement("td");
+      tdNode.className = "col-node";
+      const nn = document.createElement("span");
+      nn.className = "node-name mono";
+      nn.title = n.node;
+      nn.textContent = n.node;
+      tdNode.appendChild(nn);
+
+      const tdPool = document.createElement("td");
+      const np = document.createElement("span");
+      np.className = "nodepool mono";
+      np.title = n.nodepool || "";
+      np.textContent = n.nodepool || "(none)";
+      tdPool.appendChild(np);
+
+      const tdCost = document.createElement("td");
+      tdCost.className = "right mono";
+      tdCost.textContent = fmtUsd(n.cost_daily_usd);
+
+      // CPU cell
+      const tdCpu = document.createElement("td");
+      const mCpu = document.createElement("div");
+      mCpu.className = "metric";
+      const topCpu = document.createElement("div");
+      topCpu.className = "topline";
+      const l1 = document.createElement("span");
+      l1.className = "label";
+      l1.textContent = "CPU";
+      const v1 = document.createElement("span");
+      v1.className = "val";
+      v1.textContent = (n.alloc_cpu_m||0) + "m / " + (n.sum_req_cpu_m||0) + "m";
+      topCpu.appendChild(l1); topCpu.appendChild(v1);
+      mCpu.appendChild(topCpu);
+      mCpu.appendChild(buildBar(nodeCpuParts(n), Math.max(1, n.alloc_cpu_m||1)));
+      tdCpu.appendChild(mCpu);
+
+      // RAM cell
+      const tdRam = document.createElement("td");
+      const mRam = document.createElement("div");
+      mRam.className = "metric";
+      const topRam = document.createElement("div");
+      topRam.className = "topline";
+      const l2 = document.createElement("span");
+      l2.className = "label";
+      l2.textContent = "RAM";
+      const v2 = document.createElement("span");
+      v2.className = "val";
+      v2.textContent = fmtMiB(n.alloc_mem_b||0) + " / " + fmtMiB(n.sum_req_mem_b||0) + " MiB";
+      topRam.appendChild(l2); topRam.appendChild(v2);
+      mRam.appendChild(topRam);
+      const memParts = nodeMemPartsMiB(n);
+      mRam.appendChild(buildBar(memParts, Math.max(1, (n.alloc_mem_b||0)/(1024*1024))));
+      tdRam.appendChild(mRam);
+
+      tr.appendChild(tdNode);
+      tr.appendChild(tdPool);
+      tr.appendChild(tdCost);
+      tr.appendChild(tdCpu);
+      tr.appendChild(tdRam);
+
+      tb.appendChild(tr);
+    }
+
+    // attach sort handlers (once)
+    const headers = document.querySelectorAll("th[data-sort]");
+    headers.forEach(h=>{
+      if (h.dataset.bound) return;
+      h.dataset.bound = "1";
+      h.addEventListener("click", ()=>{
+        const k = h.getAttribute("data-sort");
+        if (!k) return;
+        if (state.sortKey === k){
+          state.sortDir = (state.sortDir === "asc") ? "desc" : "asc";
+        }else{
+          state.sortKey = k;
+          state.sortDir = (k === "gfw" || k === "cost" || k === "cpu" || k === "ram") ? "desc" : "asc";
+        }
+        renderNodes();
+      });
+    });
+  }
+
+  function renderPods(){
+    const sim = state.sim;
+    const node = state.selectedNode;
+    el("selNode").textContent = node || "—";
+    const tb = el("podsBody");
+    tb.innerHTML = "";
+
+    if (!sim || !node){
+      el("podsCount").textContent = "0";
+      return;
+    }
+    const list = (sim.pods_by_node && sim.pods_by_node[node]) ? sim.pods_by_node[node] : [];
+    el("podsCount").textContent = String(list.length);
+
+    for (const p of list){
+      const tr = document.createElement("tr");
+      tr.className = "drag";
+      tr.draggable = true;
+      tr.addEventListener("dragstart", (e)=>{
+        e.dataTransfer.setData("text/plain", p.pod_id);
+        e.dataTransfer.effectAllowed = "move";
+      });
+
+      const tdNs = document.createElement("td");
+      tdNs.className = "mono";
+      tdNs.textContent = p.namespace;
+
+      const tdName = document.createElement("td");
+      tdName.className = "mono";
+      tdName.title = p.name;
+      tdName.textContent = p.name;
+
+      const tdOwner = document.createElement("td");
+      tdOwner.className = "mono";
+      tdOwner.textContent = (p.owner_kind || "") + (p.owner_name ? "/" + p.owner_name : "");
+
+      const tdType = document.createElement("td");
+      tdType.textContent = p.is_daemon ? "DaemonSet" : "Workload";
+
+      const tdCpu = document.createElement("td");
+      tdCpu.className = "right mono";
+      tdCpu.textContent = String(p.req_cpu_m || 0);
+
+      const tdMem = document.createElement("td");
+      tdMem.className = "right mono";
+      tdMem.textContent = String(Math.round((p.req_mem_b || 0) / (1024*1024)));
+
+      const tdFlags = document.createElement("td");
+      if (p.is_system) tdFlags.appendChild(tag("system","sys"));
+      if (p.is_daemon) tdFlags.appendChild(tag("daemonset","ds"));
+
+      tr.appendChild(tdNs);
+      tr.appendChild(tdName);
+      tr.appendChild(tdOwner);
+      tr.appendChild(tdType);
+      tr.appendChild(tdCpu);
+      tr.appendChild(tdMem);
+      tr.appendChild(tdFlags);
+
+      tb.appendChild(tr);
+    }
+  }
+
+  function tag(txt, cls){
+    const s = document.createElement("span");
+    s.className = "tag " + cls;
+    s.textContent = txt;
+    return s;
+  }
+
+  function applySummary(sim){
+    el("sumAll").textContent = fmtUsd(sim.summary?.total_cost_daily_usd || 0);
+    el("sumGfw").textContent = fmtUsd(sim.summary?.total_cost_gfw_nodes_usd || 0);
+    el("sumKeda").textContent = fmtUsd(sim.summary?.total_cost_keda_nodes_usd || 0);
+  }
+
+  async function loadSim(){
+    setBusy(true);
+    try{
+      const sim = await apiGetSim();
+      state.sim = sim;
+      state.nodes = (sim.nodes || []).slice();
+
+      // default selection: first node or keep selection
+      if (!state.selectedNode){
+        state.selectedNode = state.nodes.length ? state.nodes[0].node : null;
+      }else{
+        // if selected node vanished (e.g. GC), pick first
+        if (!state.nodes.find(x=>x.node===state.selectedNode)){
+          state.selectedNode = state.nodes.length ? state.nodes[0].node : null;
+        }
+      }
+
+      // default sort: nodes with GFW first
+      if (state.sortKey === "gfw"){
+        // ok
+      }
+
+      applySummary(sim);
+      renderViolations(sim);
+      renderNodes();
+      renderPods();
+      setMsg("Готово. Перетащите pod на ноду для перемещения в её nodepool.");
+    }catch(err){
+      setMsg("Ошибка загрузки /simulate: " + (err?.message || err), true);
+    }finally{
+      setBusy(false);
+    }
+  }
+
+  // Buttons
+  el("btnRefresh").addEventListener("click", ()=>loadSim());
+  el("btnReset").addEventListener("click", async ()=>{
+    try{
+      setBusy(true);
+      setMsg("Сбрасываю к baseline…");
+      await apiMutateOne({op:"reset_to_baseline"});
+      await loadSim();
+      setMsg("Сброшено к baseline.");
+    }catch(err){
+      setMsg("Ошибка reset: " + (err?.message || err), true);
+    }finally{
+      setBusy(false);
+    }
+  });
+  el("btnRefreshPrices").addEventListener("click", async ()=>{
+    try{
+      setBusy(true);
+      setMsg("Обновляю прайсы из AWS…");
+      await apiPost("/admin/refresh-prices", {});
+      await loadSim();
+      setMsg("Прайсы обновлены.");
+    }catch(err){
+      setMsg("Ошибка refresh-prices: " + (err?.message || err), true);
+    }finally{
+      setBusy(false);
+    }
+  });
+
+  // init
+  loadSim();
+</script>
+</body>
+</html>
