@@ -9,10 +9,6 @@ from ..model.entities import Snapshot
 from .from_legacy import snapshot_from_legacy_data
 
 def snapshot_to_dict(snap: Snapshot) -> Dict[str, Any]:
-    """
-    Сериализует Snapshot в словарь.
-    """
-    
     # 1. Nodes
     nodes_dict = {}
     nodes = getattr(snap, "nodes", {})
@@ -27,6 +23,8 @@ def snapshot_to_dict(snap: Snapshot) -> Dict[str, Any]:
             "labels": n.labels,
             "taints": n.taints,
             "is_virtual": n.is_virtual,
+            # NEW FIELD
+            "uptime_hours_24h": float(n.uptime_hours_24h)
         }
 
     # 2. Pods
@@ -41,11 +39,8 @@ def snapshot_to_dict(snap: Snapshot) -> Dict[str, Any]:
             "owner_name": p.owner_name,
             "req_cpu_m": int(p.req_cpu_m or 0),
             "req_mem_b": int(p.req_mem_b or 0),
-            
-            # --- ВАЖНО: Сохраняем метрики ---
             "usage_cpu_m": int(p.usage_cpu_m or 0),
             "usage_mem_b": int(p.usage_mem_b or 0),
-            
             "is_daemon": p.is_daemonset,
             "is_system": p.is_system,
             "is_gfw": p.is_gfw,
@@ -54,18 +49,13 @@ def snapshot_to_dict(snap: Snapshot) -> Dict[str, Any]:
             "affinity": p.affinity
         }
 
-    # 3. Prices
     prices_map = {}
     prices = getattr(snap, "prices", {})
     for k, v in prices.items():
         prices_map[str(k)] = float(v.usd_per_hour)
 
-    # 4. Сборка
     return {
-        "baseline": {
-            "nodes": nodes_dict,
-            "pods": pods_dict
-        },
+        "baseline": {"nodes": nodes_dict, "pods": pods_dict},
         "prices_by_instance": prices_map,
         "keda_pool": getattr(snap, "keda_pool_name", None)
     }

@@ -37,6 +37,9 @@ class Node:
     labels: Dict[str, str] = field(default_factory=dict)
     taints: List[Dict[str, str]] = field(default_factory=list)
     is_virtual: bool = False
+    
+    # Новое поле: сколько часов нода была онлайн за последние 24ч
+    uptime_hours_24h: float = 24.0
 
 
 @dataclass

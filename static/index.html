@@ -89,7 +89,7 @@
 
     .summary{
       display:grid;
-      grid-template-columns: repeat(3, minmax(220px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
       gap:12px;
     }
     .card{
@@ -399,29 +399,8 @@
   </div>
 
   <div class="wrap">
-    <div class="summary">
-      <div class="card">
-        <div class="hdr"><h3>Все ноды, $/день</h3><span class="pill" id="pillLoaded">…</span></div>
-        <div class="body">
-          <div class="big" id="sumAll">0.00</div>
-          <div class="muted">Стоимость всех нод кластера</div>
+    <div class="summary" id="summaryBlock">
         </div>
-      </div>
-      <div class="card">
-        <div class="hdr"><h3>Ноды с GFW, $/день</h3><span class="pill">GFW</span></div>
-        <div class="body">
-          <div class="big" id="sumGfw">0.00</div>
-          <div class="muted">Подмножество нод, где есть GFW-поды</div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="hdr"><h3>KEDA-Nightly, $/день</h3><span class="pill">schedule</span></div>
-        <div class="body">
-          <div class="big" id="sumKeda">0.00</div>
-          <div class="muted">С учётом расписания пула (будни 08:00–20:00, без выходных)</div>
-        </div>
-      </div>
-    </div>
 
     <div class="card viol-card" id="violCard">
       <div class="hdr">
@@ -447,7 +426,7 @@
                 <tr>
                   <th data-sort="node" class="col-node">Нода</th>
                   <th data-sort="nodepool">Nodepool</th>
-                  <th data-sort="cost" class="right">$/день</th>
+                  <th data-sort="cost" class="right">$/день (Run Rate)</th>
                   <th data-sort="cpu">CPU (req / use)</th>
                   <th data-sort="ram">RAM (req / use)</th>
                 </tr>
@@ -1036,11 +1015,30 @@
     s.textContent = txt;
     return s;
   }
+  
+  // UPDATED SUMMARY LOGIC (Re-inserted)
   function applySummary(sim){
-    el("sumAll").textContent = fmtUsd(sim.summary?.total_cost_daily_usd || 0);
-    el("sumGfw").textContent = fmtUsd(sim.summary?.total_cost_gfw_nodes_usd || 0);
-    el("sumKeda").textContent = fmtUsd(sim.summary?.total_cost_keda_nodes_usd || 0);
+    const poolCosts = sim.summary?.pool_costs_usd || {};
+    const summaryContainer = el("summaryBlock");
+    summaryContainer.innerHTML = "";
+
+    // Total Cost Card
+    const totalCard = document.createElement("div");
+    totalCard.className = "card";
+    totalCard.innerHTML = `<div class="hdr"><h3>Projected Daily Cost</h3><span class="pill" id="pillLoaded">ok</span></div><div class="body"><div class="big" id="sumAll">${fmtUsd(sim.summary?.total_cost_daily_usd || 0)}</div><div class="muted">Based on current node count * 24h</div></div>`;
+    summaryContainer.appendChild(totalCard);
+
+    // Dynamic cards for each pool (sorted by cost descending)
+    const pools = Object.keys(poolCosts).sort((a,b) => poolCosts[b] - poolCosts[a]);
+    pools.forEach(pool => {
+        const cost = poolCosts[pool];
+        const card = document.createElement("div");
+        card.className = "card";
+        card.innerHTML = `<div class="hdr"><h3>${pool}</h3><span class="pill">24h actual</span></div><div class="body"><div class="big">${fmtUsd(cost)}</div><div class="muted">Cost over last 24h (based on uptime)</div></div>`;
+        summaryContainer.appendChild(card);
+    });
   }
+
   async function loadSim(){
     setBusy(true);
     try{

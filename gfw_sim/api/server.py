@@ -5,6 +5,7 @@ import json
 import time
 import copy
 import logging
+import os  # <-- Нужно для сортировки по времени
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
@@ -107,10 +108,7 @@ def _pick_instance_type(node) -> str:
 def to_simulation_response(snapshot) -> SimulationResponse:
     sim = run_simulation(snapshot)
     
-    # 1. Получаем нарушения в формате {NodeName: [{"pod_id":..., "reasons":...}]}
     raw_violations = check_all_placements(snapshot)
-    
-    # 2. Преобразуем в плоский формат {PodId: [Reasons]} для фронтенда и схемы
     violations: Dict[str, List[str]] = {}
     for node_vs in raw_violations.values():
         for v in node_vs:
@@ -131,6 +129,11 @@ def to_simulation_response(snapshot) -> SimulationResponse:
                 alloc_mem_b=row.alloc_mem_b,
                 sum_req_cpu_m=row.sum_req_cpu_m,
                 sum_req_mem_b=row.sum_req_mem_b,
+                
+                # --- Передаем метрики usage ---
+                sum_usage_cpu_m=row.sum_usage_cpu_m,
+                sum_usage_mem_b=row.sum_usage_mem_b,
+                
                 ram_util_pct=row.ram_util_pct,
                 ram_ds_gib=row.ram_ds_gib,
                 ram_gfw_gib=row.ram_gfw_gib,
@@ -152,11 +155,9 @@ def to_simulation_response(snapshot) -> SimulationResponse:
     for node_name, pods in sim.pods_by_node.items():
         items: List[PodViewModel] = []
         for p in pods:
-            # PodId во внутренней структуре PodView уже может быть строкой
-            pod_id = f"{p.namespace}/{p.name}"
             items.append(
                 PodViewModel(
-                    pod_id=pod_id,
+                    pod_id=f"{p.namespace}/{p.name}",
                     namespace=p.namespace,
                     name=p.name,
                     owner_kind=getattr(p, "owner_kind", None),
@@ -175,12 +176,13 @@ def to_simulation_response(snapshot) -> SimulationResponse:
             total_cost_daily_usd=sim.total_cost_daily_usd,
             total_cost_gfw_nodes_usd=sim.total_cost_gfw_nodes_usd,
             total_cost_keda_nodes_usd=sim.total_cost_keda_nodes_usd,
+            # --- Передаем стоимость пулов ---
+            pool_costs_usd=sim.pool_costs_usd
         ),
         nodes=nodes,
         pods_by_node=pods_by_node,
         violations=violations,
     )
-
 # ---------------------------------------------------------------------------
 # Snapshot Manager
 # ---------------------------------------------------------------------------
@@ -192,6 +194,8 @@ class SnapshotManager:
 
     def add(self, snapshot_id: str, snapshot: Snapshot):
         self.snapshots[snapshot_id] = snapshot
+        # Логика "первого" больше не нужна здесь, 
+        # активный снапшот будем выставлять явно при загрузке.
         if self.active_id is None:
             self.active_id = snapshot_id
 
@@ -224,38 +228,51 @@ LEGACY_PATH = Path(__file__).resolve().parents[1] / "snapshot" / "legacy.json"
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    # 1. Загрузка Legacy Baseline (если есть)
     try:
         if LEGACY_PATH.exists():
             data = json.loads(LEGACY_PATH.read_text("utf-8"))
             baseline = snapshot_from_legacy_data(data)
             manager.add("baseline", baseline)
-            
-            working = _clone_snapshot(baseline)
-            manager.add("working-copy", working)
-            manager.set_active("working-copy")
+            # Временно ставим активным, но позже перепишем, если найдем файлы
+            manager.set_active("baseline")
             log.info("Baseline loaded.")
     except Exception as e:
         log.warning(f"Failed to load baseline: {e}")
 
+    # 2. Загрузка снапшотов из папки + выбор последнего
     try:
         if not SNAPSHOTS_DIR.exists():
             SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
         
+        # Получаем список файлов и сортируем по времени изменения (от старых к новым)
+        snap_files = list(SNAPSHOTS_DIR.glob("*.json"))
+        snap_files.sort(key=lambda p: p.stat().st_mtime)
+        
         count = 0
-        for snap_file in SNAPSHOTS_DIR.glob("*.json"):
+        last_loaded_id = None
+        
+        for snap_file in snap_files:
             try:
                 snap = load_snapshot_from_file(snap_file)
                 sid = snap_file.stem
                 manager.add(sid, snap)
+                last_loaded_id = sid
                 count += 1
             except Exception as e:
                 log.error(f"Failed to load snapshot {snap_file}: {e}")
         
         log.info(f"Loaded {count} snapshots from disk.")
         
+        # 3. Активируем самый свежий (последний в списке)
+        if last_loaded_id:
+            manager.set_active(last_loaded_id)
+            log.info(f"Activated latest snapshot: {last_loaded_id}")
+        
     except Exception as e:
         log.error(f"Error loading snapshots directory: {e}")
 
+    # Обновление цен для активного снапшота
     current = manager.get_active()
     if current:
         try:
@@ -287,6 +304,7 @@ class CreateSnapshotResponse(BaseModel):
 def list_snapshots():
     result = []
     active = manager.active_id
+    # Сортируем ключи, чтобы список был стабильным (можно по времени, но по имени тоже ок)
     keys = sorted(manager.snapshots.keys())
     
     for sid in keys:
@@ -312,6 +330,7 @@ def capture_snapshot():
         save_snapshot_to_file(new_snap, file_path)
         
         manager.add(new_id, new_snap)
+        manager.set_active(new_id) # Сразу активируем новый
         
         try:
             itypes = sorted({
@@ -340,10 +359,6 @@ def activate_snapshot(snapshot_id: str):
 # ---------------------------------------------------------------------------
 
 def _derive_placement_patches(node: Any, nodepool: Optional[NodePool]) -> tuple[List[Dict], Dict]:
-    """
-    Генерирует Tolerations и NodeSelector для того, чтобы под попал на ноду.
-    Полагается только на данные, лежащие в snapshot (никакой эвристики).
-    """
     tolerations = []
     seen_keys = set()
     
@@ -357,7 +372,6 @@ def _derive_placement_patches(node: Any, nodepool: Optional[NodePool]) -> tuple[
         })
         seen_keys.add(key)
 
-    # 1. Tolerations из Taints самой ноды
     node_taints = getattr(node, "taints", []) or []
     for t in node_taints:
         k = t.get("key")
@@ -366,7 +380,6 @@ def _derive_placement_patches(node: Any, nodepool: Optional[NodePool]) -> tuple[
         op = "Equal" if v else "Exists"
         _add_tol(k, v, op, eff)
 
-    # 2. Tolerations из NodePool
     if nodepool:
         pool_taints = getattr(nodepool, "taints", []) or []
         for t in pool_taints:
@@ -376,7 +389,6 @@ def _derive_placement_patches(node: Any, nodepool: Optional[NodePool]) -> tuple[
             op = "Equal" if v else "Exists"
             _add_tol(k, v, op, eff)
             
-    # 3. NodeSelector
     node_selector = {}
     pool_name = getattr(node, "nodepool", None)
     if pool_name:
@@ -392,7 +404,6 @@ def plan_move(req: PlanMoveRequest) -> PlanMoveResponse:
     
     pod = snap.pods.get(req.pod_id)
     if not pod:
-        # Если pod_id пришел как 'namespace/name'
         pod = snap.pods.get(PodId(req.pod_id))
     
     if not pod:
@@ -443,7 +454,21 @@ def mutate(req: MutateRequest | OperationModel) -> SimulationResponse:
     
     for op in ops:
         if op.op == "reset_to_baseline":
-            if "baseline" in manager.snapshots:
+            # Сбрасываем к последнему загруженному (baseline может быть не актуален)
+            # Логичнее сбрасывать к "активному на момент старта" или перечитывать файл
+            # В текущей логике "baseline" - это legacy файл.
+            # Если мы хотим reset к текущему снапшоту, нужно хранить его копию.
+            # Пока оставим как есть или можно сделать reload активного ID.
+            if manager.active_id and manager.active_id in manager.snapshots:
+                 # ПРОСТОЙ RESET: Перезагружаем текущий активный снапшот из памяти (или файла)
+                 # Но так как мы мутируем объект в памяти, нам нужна исходная копия.
+                 # Для упрощения: просто перезагрузим файл с диска для активного ID
+                 if manager.active_id.startswith("k8s-"):
+                     path = SNAPSHOTS_DIR / f"{manager.active_id}.json"
+                     if path.exists():
+                         snap = load_snapshot_from_file(path)
+                         manager.snapshots[manager.active_id] = snap
+            elif "baseline" in manager.snapshots:
                 snap = _clone_snapshot(manager.snapshots["baseline"])
                 manager.add("working-copy", snap)
                 manager.set_active("working-copy")
