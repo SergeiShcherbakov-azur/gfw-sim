@@ -95,7 +95,12 @@ def _taint_tolerated(
             if value is None:
                 # taint без value, достаточно совпадения key
                 return True
-            if str(t_val) == str(value):
+            
+            # --- FIX: Robust comparison (str/bool/case-insensitive) ---
+            v1 = str(t_val).lower() if t_val is not None else ""
+            v2 = str(value).lower() if value is not None else ""
+            
+            if v1 == v2:
                 return True
 
     return False
