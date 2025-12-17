@@ -80,10 +80,18 @@ def snapshot_from_legacy_data(data: dict) -> Snapshot:
     # NodePool'ы
     nodepools: Dict[NodePoolName, NodePool] = {}
     for node_name, n in baseline["nodes"].items():
-        pool_name = NodePoolName(n["nodepool"])
+        # Защита от отсутствия поля nodepool
+        pool_str = n.get("nodepool", "default") or "default"
+        pool_name = NodePoolName(pool_str)
+        
         if pool_name in nodepools:
             continue
-        is_keda = bool(keda_pool) and n["nodepool"] == keda_pool
+            
+        is_keda = bool(keda_pool) and pool_str == keda_pool
+        # Если keda_pool не задан, пробуем угадать по имени
+        if not is_keda and "keda" in pool_str.lower():
+            is_keda = True
+
         nodepools[pool_name] = NodePool(
             name=pool_name,
             labels={},
@@ -96,13 +104,15 @@ def snapshot_from_legacy_data(data: dict) -> Snapshot:
     nodes: Dict[NodeId, Node] = {}
     for node_name, n in baseline["nodes"].items():
         node_id = NodeId(node_name)
+        pool_str = n.get("nodepool", "default") or "default"
+        
         nodes[node_id] = Node(
             id=node_id,
             name=node_name,
-            nodepool=NodePoolName(n["nodepool"]),
-            instance_type=InstanceType(n["instance_type"]),
-            alloc_cpu_m=CpuMillis(int(n["alloc_cpu_m"])),
-            alloc_mem_b=Bytes(int(n["alloc_mem_b"])),
+            nodepool=NodePoolName(pool_str),
+            instance_type=InstanceType(n.get("instance_type", "unknown")),
+            alloc_cpu_m=CpuMillis(int(n.get("alloc_cpu_m", 0))),
+            alloc_mem_b=Bytes(int(n.get("alloc_mem_b", 0))),
             capacity_type="on_demand",
             labels=n.get("labels", {}),
             taints=n.get("taints", []),
@@ -112,14 +122,18 @@ def snapshot_from_legacy_data(data: dict) -> Snapshot:
     # Pod'ы
     pods: Dict[PodId, Pod] = {}
     for key, p in baseline["pods"].items():
-        ns_str = p["namespace"]
+        ns_str = p.get("namespace", "default")
         ns = Namespace(ns_str)
         pod_id = PodId(key)
         node_name: Optional[str] = p.get("node")
 
+        # --- ЧИТАЕМ МЕТРИКИ ---
+        u_cpu = p.get("usage_cpu_m")
+        u_mem = p.get("usage_mem_b")
+
         pods[pod_id] = Pod(
             id=pod_id,
-            name=p["name"],
+            name=p.get("name", ""),
             namespace=ns,
             node=NodeId(node_name) if node_name else None,
             owner_kind=p.get("owner_kind"),
@@ -134,6 +148,10 @@ def snapshot_from_legacy_data(data: dict) -> Snapshot:
             tolerations=p.get("tolerations", []) or [],
             node_selector=p.get("node_selector", {}) or {},
             affinity=p.get("affinity", {}) or {},
+            
+            # Передаем в конструктор
+            usage_cpu_m=CpuMillis(u_cpu) if u_cpu is not None else None,
+            usage_mem_b=Bytes(u_mem) if u_mem is not None else None,
         )
 
     snapshot = Snapshot(

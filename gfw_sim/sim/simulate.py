@@ -71,9 +71,7 @@ def _iter_snapshot_nodes(snapshot) -> Iterable:
 def run_simulation(snapshot) -> SimulationResult:
     pods_by_node: Dict[str, List[PodView]] = {}
     
-    # Чтобы посчитать сумму usage, нам нужен доступ к объектам Pod из снапшота, 
-    # а PodView их не содержит. Будем считать сумму на лету или сохраним мапу.
-    # Проще сохранить сырые поды в мапу для агрегации.
+    # Сохраняем сырые поды для доступа к usage_*, т.к. PodView их не содержит
     raw_pods_by_node = {}
 
     for pod in _iter_snapshot_pods(snapshot):
@@ -95,11 +93,15 @@ def run_simulation(snapshot) -> SimulationResult:
     total_cost_keda_nodes = 0.0
 
     for node in _iter_snapshot_nodes(snapshot):
-        node_name = node.name
-        nodepool = node.nodepool
-        instance_type = node.instance_type
-        alloc_cpu_m = int(node.alloc_cpu_m or 0)
-        alloc_mem_b = int(node.alloc_mem_b or 0)
+        node_name = getattr(node, "name", "") or ""
+        
+        # --- FIX: Защита от None в nodepool ---
+        nodepool_val = getattr(node, "nodepool", "")
+        nodepool = str(nodepool_val) if nodepool_val is not None else ""
+        
+        instance_type = getattr(node, "instance_type", "") or ""
+        alloc_cpu_m = int(getattr(node, "alloc_cpu_m", 0) or 0)
+        alloc_mem_b = int(getattr(node, "alloc_mem_b", 0) or 0)
         
         node_pods_view = pods_by_node.get(node_name, [])
         node_pods_raw = raw_pods_by_node.get(node_name, [])
@@ -124,12 +126,13 @@ def run_simulation(snapshot) -> SimulationResult:
         sum_req_mem_b = parts.gfw_mem_b + parts.ds_mem_b + parts.other_mem_b
 
         # Usage Sums (Peak 1d)
-        # Если usage не собрался (None), считаем как 0, или можно фолбечить на request, но честнее 0.
-        sum_usage_cpu_m = sum((p.usage_cpu_m or 0) for p in node_pods_raw)
-        sum_usage_mem_b = sum((p.usage_mem_b or 0) for p in node_pods_raw)
+        sum_usage_cpu_m = sum((getattr(p, "usage_cpu_m", 0) or 0) for p in node_pods_raw)
+        sum_usage_mem_b = sum((getattr(p, "usage_mem_b", 0) or 0) for p in node_pods_raw)
 
         cost_daily_usd, price_missing = costs.node_daily_cost_from_instance(instance_type, nodepool)
         
+        is_virtual = bool(getattr(node, "is_virtual", False))
+
         row = NodeRow(
             node=node_name, nodepool=nodepool, instance=instance_type,
             gfw_ratio_pct=gfw_ratio_pct,
@@ -139,13 +142,16 @@ def run_simulation(snapshot) -> SimulationResult:
             ram_util_pct=(sum_req_mem_b / alloc_mem_b * 100.0) if alloc_mem_b else 0.0,
             ram_ds_gib=_bytes_to_gib(parts.ds_mem_b), ram_gfw_gib=_bytes_to_gib(parts.gfw_mem_b),
             cost_daily_usd=cost_daily_usd, parts=parts,
-            is_virtual=node.is_virtual, price_missing=price_missing
+            is_virtual=is_virtual, price_missing=price_missing
         )
         nodes_table.append(row)
         
         total_cost_daily += cost_daily_usd
         if parts.gfw_cpu_m > 0 or parts.gfw_mem_b > 0: total_cost_gfw_nodes += cost_daily_usd
-        if "keda" in nodepool.lower(): total_cost_keda_nodes += cost_daily_usd
+        
+        # --- FIX: Безопасная проверка ---
+        if "keda" in nodepool.lower(): 
+            total_cost_keda_nodes += cost_daily_usd
 
     return SimulationResult(
         nodes_table=nodes_table, pods_by_node=pods_by_node,

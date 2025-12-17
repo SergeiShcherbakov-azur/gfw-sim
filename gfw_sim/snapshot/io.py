@@ -10,8 +10,7 @@ from .from_legacy import snapshot_from_legacy_data
 
 def snapshot_to_dict(snap: Snapshot) -> Dict[str, Any]:
     """
-    Сериализует Snapshot в словарь, совместимый со структурой legacy.json.
-    Это позволяет использовать существующий загрузчик (snapshot_from_legacy_data).
+    Сериализует Snapshot в словарь.
     """
     
     # 1. Nodes
@@ -34,7 +33,6 @@ def snapshot_to_dict(snap: Snapshot) -> Dict[str, Any]:
     pods_dict = {}
     pods = getattr(snap, "pods", {})
     for p in pods.values():
-        # Сохраняем поля, ожидаемые loader'ом
         pods_dict[p.id] = {
             "name": p.name,
             "namespace": p.namespace,
@@ -43,6 +41,11 @@ def snapshot_to_dict(snap: Snapshot) -> Dict[str, Any]:
             "owner_name": p.owner_name,
             "req_cpu_m": int(p.req_cpu_m or 0),
             "req_mem_b": int(p.req_mem_b or 0),
+            
+            # --- ВАЖНО: Сохраняем метрики ---
+            "usage_cpu_m": int(p.usage_cpu_m or 0),
+            "usage_mem_b": int(p.usage_mem_b or 0),
+            
             "is_daemon": p.is_daemonset,
             "is_system": p.is_system,
             "is_gfw": p.is_gfw,
@@ -52,7 +55,6 @@ def snapshot_to_dict(snap: Snapshot) -> Dict[str, Any]:
         }
 
     # 3. Prices
-    # from_legacy ожидает prices_by_instance {type: cost}
     prices_map = {}
     prices = getattr(snap, "prices", {})
     for k, v in prices.items():
@@ -69,13 +71,11 @@ def snapshot_to_dict(snap: Snapshot) -> Dict[str, Any]:
     }
 
 def save_snapshot_to_file(snap: Snapshot, path: Path) -> None:
-    """Сохраняет снапшот в JSON-файл."""
     data = snapshot_to_dict(snap)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, sort_keys=True)
 
 def load_snapshot_from_file(path: Path) -> Snapshot:
-    """Читает JSON-файл и восстанавливает Snapshot."""
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     return snapshot_from_legacy_data(data)
