@@ -126,8 +126,21 @@ def collect_k8s_snapshot(k8s_context: str | None = None) -> Snapshot:
                 "effect": t.get("effect")
             })
 
-        is_keda = "keda" in name_str.lower()
+        is_keda = "keda" in name_str.lower() or "nightly" in name_str.lower()
         
+        # --- ENRICHMENT RULES ---
+        # Если это KEDA/Nightly пул, но в явном виде taint не прописан (например, накладывается динамически),
+        # мы добавляем его в модель снапшота, чтобы симулятор знал об этом ограничении.
+        if is_keda:
+            has_nightly_taint = any(t["key"] == "keda_nightly" for t in taints)
+            if not has_nightly_taint:
+                log.info(f"Enriching NodePool '{name}' with implicit keda_nightly taint.")
+                taints.append({
+                    "key": "keda_nightly",
+                    "value": "true",
+                    "effect": "NoSchedule"
+                })
+
         nodepools[name] = NodePool(
             name=name,
             labels=labels,
@@ -168,12 +181,26 @@ def collect_k8s_snapshot(k8s_context: str | None = None) -> Snapshot:
                     "effect": t.effect
                 })
 
+        # Если пул не был найден через CRD (или нода приписана к несуществующему пулу),
+        # создаем stub для пула.
         if pool_name not in nodepools:
-            is_keda = "keda" in pool_name_str.lower()
+            is_keda = "keda" in pool_name_str.lower() or "nightly" in pool_name_str.lower()
+            
+            # Применяем ту же логику обогащения для inferrred pools
+            inferred_taints = list(node_taints)
+            if is_keda:
+                has_nightly_taint = any(t["key"] == "keda_nightly" for t in inferred_taints)
+                if not has_nightly_taint:
+                     inferred_taints.append({
+                        "key": "keda_nightly",
+                        "value": "true",
+                        "effect": "NoSchedule"
+                    })
+            
             nodepools[pool_name] = NodePool(
                 name=pool_name,
                 labels=labels,
-                taints=node_taints,
+                taints=inferred_taints,
                 is_keda=is_keda,
                 schedule_name="keda-weekdays-12h" if is_keda else "default"
             )

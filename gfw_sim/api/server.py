@@ -26,7 +26,7 @@ from ..sim.operations import (
     delete_pods,
     delete_namespace,
     delete_owner,
-    patch_pods_in_snapshot,  # NEW
+    patch_pods_in_snapshot,
 )
 from ..sim.constraints import check_all_placements
 from ..sim import costs as sim_costs
@@ -39,8 +39,8 @@ from .schema import (
     PodViewModel,
     MutateRequest,
     OperationModel,
-    PlanMoveRequest,   # NEW
-    PlanMoveResponse,  # NEW
+    PlanMoveRequest,
+    PlanMoveResponse,
 )
 from ..sim.packing import move_pods_to_pool
 
@@ -219,7 +219,6 @@ app = FastAPI(title="GFW Capacity Simulator")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STATIC_DIR = PROJECT_ROOT / "static"
-# Папка для сохраняемых снапшотов
 SNAPSHOTS_DIR = PROJECT_ROOT / "snapshots"
 LEGACY_PATH = Path(__file__).resolve().parents[1] / "snapshot" / "legacy.json"
 
@@ -342,36 +341,42 @@ def activate_snapshot(snapshot_id: str):
 
 def _derive_placement_patches(node: Any, nodepool: Optional[NodePool]) -> tuple[List[Dict], Dict]:
     """
-    Генерирует Tolerations и NodeSelector, необходимые для того, чтобы под
-    гарантированно попал на указанную ноду (и её пул).
+    Генерирует Tolerations и NodeSelector для того, чтобы под попал на ноду.
+    Полагается только на данные, лежащие в snapshot (никакой эвристики).
     """
     tolerations = []
+    seen_keys = set()
     
-    # 1. Собираем Tolerations из Taints ноды
+    def _add_tol(key, value, operator, effect):
+        if key in seen_keys: return
+        tolerations.append({
+            "key": key, 
+            "operator": operator, 
+            "value": value, 
+            "effect": effect
+        })
+        seen_keys.add(key)
+
+    # 1. Tolerations из Taints самой ноды
     node_taints = getattr(node, "taints", []) or []
     for t in node_taints:
-        # Для каждого Taint создаем Toleration "Exists"
-        tolerations.append({
-            "key": t.get("key"),
-            "operator": "Equal" if t.get("value") else "Exists",
-            "value": t.get("value"),
-            "effect": t.get("effect")
-        })
+        k = t.get("key")
+        v = t.get("value")
+        eff = t.get("effect")
+        op = "Equal" if v else "Exists"
+        _add_tol(k, v, op, eff)
 
-    # 2. Если есть NodePool, берем и его taints (на всякий случай, если они не проросли в ноду)
+    # 2. Tolerations из NodePool
     if nodepool:
-        for t in nodepool.taints:
-            # Проверяем дубли
-            if not any(tol.get("key") == t.get("key") for tol in tolerations):
-                 tolerations.append({
-                    "key": t.get("key"),
-                    "operator": "Equal" if t.get("value") else "Exists",
-                    "value": t.get("value"),
-                    "effect": t.get("effect")
-                })
-    
+        pool_taints = getattr(nodepool, "taints", []) or []
+        for t in pool_taints:
+            k = t.get("key")
+            v = t.get("value")
+            eff = t.get("effect")
+            op = "Equal" if v else "Exists"
+            _add_tol(k, v, op, eff)
+            
     # 3. NodeSelector
-    # Самый надежный способ - привязаться к NodePool Name (karpenter.sh/nodepool)
     node_selector = {}
     pool_name = getattr(node, "nodepool", None)
     if pool_name:
@@ -387,14 +392,12 @@ def plan_move(req: PlanMoveRequest) -> PlanMoveResponse:
     
     pod = snap.pods.get(req.pod_id)
     if not pod:
-        # Если pod_id пришел в виде namespace/name, попробуем найти
+        # Если pod_id пришел как 'namespace/name'
         pod = snap.pods.get(PodId(req.pod_id))
     
     if not pod:
          raise HTTPException(status_code=404, detail=f"Pod {req.pod_id} not found")
          
-    # Ищем целевую ноду
-    # req.target_node это имя ноды
     target_node = snap.nodes.get(NodeId(req.target_node))
     if not target_node:
         raise HTTPException(status_code=404, detail=f"Target node {req.target_node} not found")
@@ -439,9 +442,6 @@ def mutate(req: MutateRequest | OperationModel) -> SimulationResponse:
     ops = req.operations if isinstance(req, MutateRequest) else [req]
     
     for op in ops:
-        # Если заданы overrides, применяем их к подам в снапшоте ПЕРЕД операцией переноса.
-        # Для `move_pods_to_pool` и `move_node_pods_to_pool` это имеет прямой смысл.
-        
         if op.op == "reset_to_baseline":
             if "baseline" in manager.snapshots:
                 snap = _clone_snapshot(manager.snapshots["baseline"])
@@ -470,7 +470,6 @@ def mutate(req: MutateRequest | OperationModel) -> SimulationResponse:
             tpool = (op.target_pool or "").strip().split()[-1]
             pids = [PodId(pid) for pid in op.pod_ids]
             
-            # Сначала патчим, если есть чем
             if op.overrides:
                 snap = patch_pods_in_snapshot(
                     snap, pids,
