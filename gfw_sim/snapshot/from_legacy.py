@@ -25,6 +25,9 @@ def snapshot_from_legacy_data(data: dict) -> Snapshot:
     prices = _merge_price_sources(data)
     keda_pool = data.get("keda_pool")
     
+    # LOAD HISTORY
+    history_usage = data.get("history_usage", [])
+    
     schedules = {
         "default": Schedule(name="default", hours_per_day=24.0, days_per_week=7.0),
         "keda-weekdays-12h": Schedule(name="keda-weekdays-12h", hours_per_day=12.0, days_per_week=5.0),
@@ -49,7 +52,6 @@ def snapshot_from_legacy_data(data: dict) -> Snapshot:
             alloc_cpu_m=CpuMillis(int(n.get("alloc_cpu_m", 0))),
             alloc_mem_b=Bytes(int(n.get("alloc_mem_b", 0))),
             capacity_type="on_demand", labels=n.get("labels", {}), taints=n.get("taints", []), is_virtual=False,
-            # NEW FIELD
             uptime_hours_24h=float(n.get("uptime_hours_24h", 24.0))
         )
 
@@ -69,4 +71,8 @@ def snapshot_from_legacy_data(data: dict) -> Snapshot:
             usage_cpu_m=CpuMillis(u_cpu) if u_cpu is not None else None, usage_mem_b=Bytes(u_mem) if u_mem is not None else None
         )
 
-    return Snapshot(nodes=nodes, pods=pods, nodepools=nodepools, prices=prices, schedules=schedules, keda_pool_name=NodePoolName(keda_pool) if keda_pool else None)
+    return Snapshot(
+        nodes=nodes, pods=pods, nodepools=nodepools, prices=prices, 
+        schedules=schedules, keda_pool_name=NodePoolName(keda_pool) if keda_pool else None,
+        history_usage=history_usage
+    )

@@ -19,16 +19,12 @@ class NodeRow:
     nodepool: str
     instance: str
     gfw_ratio_pct: float
-    
     alloc_cpu_m: int
     alloc_mem_b: int
     sum_req_cpu_m: int
     sum_req_mem_b: int
-    
-    # --- ДОБАВЛЕНО ---
     sum_usage_cpu_m: int
     sum_usage_mem_b: int
-    
     ram_util_pct: float
     ram_ds_gib: float
     ram_gfw_gib: float
@@ -56,11 +52,7 @@ class SimulationResult:
     total_cost_daily_usd: float
     total_cost_gfw_nodes_usd: float
     total_cost_keda_nodes_usd: float
-    # --- ДОБАВЛЕНО ---
     pool_costs_usd: Dict[str, float]
-
-def _bytes_to_gib(v: int) -> float:
-    return v / (1024.0 ** 3) if v else 0.0
 
 def _iter_snapshot_pods(snapshot) -> Iterable:
     pods = getattr(snapshot, "pods", None)
@@ -77,8 +69,7 @@ def run_simulation(snapshot) -> SimulationResult:
     for pod in _iter_snapshot_pods(snapshot):
         if not pod.node: continue
         pv = PodView(
-            namespace=pod.namespace, name=pod.name,
-            owner_kind=pod.owner_kind, owner_name=pod.owner_name,
+            namespace=pod.namespace, name=pod.name, owner_kind=pod.owner_kind, owner_name=pod.owner_name,
             is_gfw=bool(pod.is_gfw), is_daemon=bool(pod.is_daemonset), is_system=bool(pod.is_system),
             req_cpu_m=int(pod.req_cpu_m or 0), req_mem_b=int(pod.req_mem_b or 0),
         )
@@ -86,24 +77,34 @@ def run_simulation(snapshot) -> SimulationResult:
         raw_pods_by_node.setdefault(pod.node, []).append(pod)
 
     nodes_table: List[NodeRow] = []
-    total_cost_daily = 0.0
-    total_cost_gfw_nodes = 0.0
-    total_cost_keda_nodes = 0.0
     
-    # --- Сбор костов по пулам ---
+    # 1. Считаем исторический кост (если есть данные из VM)
+    history = getattr(snapshot, "history_usage", [])
     pool_costs_usd: Dict[str, float] = {}
+    
+    if history:
+        for entry in history:
+            pool = entry.get("pool", "unknown")
+            inst = entry.get("instance", "unknown")
+            hours = entry.get("instance_hours_24h", 0.0)
+            
+            # Получаем цену за час
+            daily, _ = costs.node_daily_cost_from_instance(inst, pool)
+            hourly_price = daily / 24.0
+            
+            cost = hourly_price * hours
+            pool_costs_usd[pool] = pool_costs_usd.get(pool, 0.0) + cost
+            
+    # 2. Считаем текущие ноды (таблица)
+    total_cost_daily_projected = 0.0 # Это по-прежнему будет Run Rate текущего снапшота
 
     for node in _iter_snapshot_nodes(snapshot):
         node_name = getattr(node, "name", "") or ""
         nodepool_val = getattr(node, "nodepool", "")
         nodepool = str(nodepool_val) if nodepool_val is not None else ""
-        
         instance_type = getattr(node, "instance_type", "") or ""
         alloc_cpu_m = int(getattr(node, "alloc_cpu_m", 0) or 0)
         alloc_mem_b = int(getattr(node, "alloc_mem_b", 0) or 0)
-        
-        # Получаем аптайм за 24 часа (дефолт 24)
-        uptime_24h = float(getattr(node, "uptime_hours_24h", 24.0))
         
         node_pods_view = pods_by_node.get(node_name, [])
         node_pods_raw = raw_pods_by_node.get(node_name, [])
@@ -111,57 +112,44 @@ def run_simulation(snapshot) -> SimulationResult:
         gfw_pods = [p for p in node_pods_view if p.is_gfw]
         ds_pods = [p for p in node_pods_view if p.is_daemon]
         other_pods = [p for p in node_pods_view if not p.is_gfw and not p.is_daemon]
-
         gfw_ratio_pct = (len(gfw_pods) / len(node_pods_view) * 100.0) if node_pods_view else 0.0
 
         parts = NodeParts(
-            gfw_cpu_m=sum(p.req_cpu_m for p in gfw_pods),
-            ds_cpu_m=sum(p.req_cpu_m for p in ds_pods),
-            other_cpu_m=sum(p.req_cpu_m for p in other_pods),
-            gfw_mem_b=sum(p.req_mem_b for p in gfw_pods),
-            ds_mem_b=sum(p.req_mem_b for p in ds_pods),
-            other_mem_b=sum(p.req_mem_b for p in other_pods),
+            gfw_cpu_m=sum(p.req_cpu_m for p in gfw_pods), ds_cpu_m=sum(p.req_cpu_m for p in ds_pods), other_cpu_m=sum(p.req_cpu_m for p in other_pods),
+            gfw_mem_b=sum(p.req_mem_b for p in gfw_pods), ds_mem_b=sum(p.req_mem_b for p in ds_pods), other_mem_b=sum(p.req_mem_b for p in other_pods),
         )
         
-        sum_req_cpu_m = parts.gfw_cpu_m + parts.ds_cpu_m + parts.other_cpu_m
-        sum_req_mem_b = parts.gfw_mem_b + parts.ds_mem_b + parts.other_mem_b
-
-        # Usage Sums (Peak 1d)
         sum_usage_cpu_m = sum((getattr(p, "usage_cpu_m", 0) or 0) for p in node_pods_raw)
         sum_usage_mem_b = sum((getattr(p, "usage_mem_b", 0) or 0) for p in node_pods_raw)
 
-        # Расчет стоимости
-        cost_24h_hypothetical, price_missing = costs.node_daily_cost_from_instance(instance_type, nodepool)
+        cost_daily_usd, price_missing = costs.node_daily_cost_from_instance(instance_type, nodepool)
+        total_cost_daily_projected += cost_daily_usd
         
-        # Реальная стоимость = цена_в_час * аптайм
-        hourly_price = cost_24h_hypothetical / 24.0
-        real_cost_24h = hourly_price * uptime_24h
-        
-        # Агрегация по пулу
-        pool_key = nodepool if nodepool else "unknown"
-        pool_costs_usd[pool_key] = pool_costs_usd.get(pool_key, 0.0) + real_cost_24h
+        # Если истории не было, фоллбечимся на простой расчет по текущим нодам
+        if not history:
+            pool_costs_usd[nodepool] = pool_costs_usd.get(nodepool, 0.0) + cost_daily_usd
 
         row = NodeRow(
             node=node_name, nodepool=nodepool, instance=instance_type,
             gfw_ratio_pct=gfw_ratio_pct,
             alloc_cpu_m=alloc_cpu_m, alloc_mem_b=alloc_mem_b,
-            sum_req_cpu_m=sum_req_cpu_m, sum_req_mem_b=sum_req_mem_b,
+            sum_req_cpu_m=parts.gfw_cpu_m + parts.ds_cpu_m + parts.other_cpu_m, 
+            sum_req_mem_b=parts.gfw_mem_b + parts.ds_mem_b + parts.other_mem_b,
             sum_usage_cpu_m=int(sum_usage_cpu_m), sum_usage_mem_b=int(sum_usage_mem_b),
-            ram_util_pct=(sum_req_mem_b / alloc_mem_b * 100.0) if alloc_mem_b else 0.0,
-            ram_ds_gib=_bytes_to_gib(parts.ds_mem_b), ram_gfw_gib=_bytes_to_gib(parts.gfw_mem_b),
-            cost_daily_usd=cost_24h_hypothetical, parts=parts,
+            ram_util_pct=(parts.gfw_mem_b + parts.ds_mem_b + parts.other_mem_b) / alloc_mem_b * 100.0 if alloc_mem_b else 0.0,
+            ram_ds_gib=parts.ds_mem_b / (1024**3), ram_gfw_gib=parts.gfw_mem_b / (1024**3),
+            cost_daily_usd=cost_daily_usd, parts=parts,
             is_virtual=bool(getattr(node, "is_virtual", False)), price_missing=price_missing
         )
         nodes_table.append(row)
-        
-        total_cost_daily += cost_24h_hypothetical
-        if parts.gfw_cpu_m > 0 or parts.gfw_mem_b > 0: total_cost_gfw_nodes += cost_24h_hypothetical
-        if "keda" in nodepool.lower(): total_cost_keda_nodes += cost_24h_hypothetical
+
+    # Используем сумму из pool_costs_usd как Total, если история есть, так точнее
+    total_cost_from_pools = sum(pool_costs_usd.values())
 
     return SimulationResult(
         nodes_table=nodes_table, pods_by_node=pods_by_node,
-        total_cost_daily_usd=total_cost_daily,
-        total_cost_gfw_nodes_usd=total_cost_gfw_nodes,
-        total_cost_keda_nodes_usd=total_cost_keda_nodes,
+        total_cost_daily_usd=total_cost_from_pools, # Теперь Total соответствует сумме карточек
+        total_cost_gfw_nodes_usd=0.0, # Deprecated fields
+        total_cost_keda_nodes_usd=0.0,
         pool_costs_usd=pool_costs_usd
     )

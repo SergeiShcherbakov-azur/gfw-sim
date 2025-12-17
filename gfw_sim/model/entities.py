@@ -38,7 +38,7 @@ class Node:
     taints: List[Dict[str, str]] = field(default_factory=list)
     is_virtual: bool = False
     
-    # Новое поле: сколько часов нода была онлайн за последние 24ч
+    # Оставляем на всякий случай, но основной расчет переводим на history_usage
     uptime_hours_24h: float = 24.0
 
 
@@ -58,12 +58,12 @@ class Pod:
     is_system: bool = False
     is_gfw: bool = False
 
-    # Новые поля для эмуляции kube-scheduler
+    # Scheduler emulation fields
     tolerations: List[Dict[str, Any]] = field(default_factory=list)
     node_selector: Dict[str, str] = field(default_factory=dict)
     affinity: Dict[str, Any] = field(default_factory=dict)
 
-    # Метрики потребления (Peak 1d)
+    # Metrics
     usage_cpu_m: Optional[CpuMillis] = None
     usage_mem_b: Optional[Bytes] = None
 
@@ -95,3 +95,7 @@ class Snapshot:
     prices: Dict[InstanceType, InstancePrice]
     schedules: Dict[str, Schedule]
     keda_pool_name: Optional[NodePoolName] = None
+    
+    # --- NEW: Historical Aggregated Usage ---
+    # List of {"pool": str, "instance": str, "instance_hours_24h": float}
+    history_usage: List[Dict[str, Any]] = field(default_factory=list)

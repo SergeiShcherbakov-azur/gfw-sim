@@ -8,8 +8,8 @@ class SimulationSummaryModel(BaseModel):
     total_cost_daily_usd: float
     total_cost_gfw_nodes_usd: float
     total_cost_keda_nodes_usd: float
-    # --- ДОБАВЛЕНО: Стоимость по пулам ---
-    pool_costs_usd: Dict[str, float]
+    # --- FIX: Добавляем поле для костов по пулам ---
+    pool_costs_usd: Dict[str, float] = {}
 
 class NodePartsModel(BaseModel):
     gfw_cpu_m: int
@@ -30,7 +30,7 @@ class NodeRowModel(BaseModel):
     sum_req_cpu_m: int
     sum_req_mem_b: int
     
-    # --- ДОБАВЛЕНО: Поля реального потребления ---
+    # --- FIX: Добавляем поля реального потребления ---
     sum_usage_cpu_m: int = 0
     sum_usage_mem_b: int = 0
     

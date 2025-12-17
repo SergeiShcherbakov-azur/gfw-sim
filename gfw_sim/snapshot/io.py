@@ -9,7 +9,6 @@ from ..model.entities import Snapshot
 from .from_legacy import snapshot_from_legacy_data
 
 def snapshot_to_dict(snap: Snapshot) -> Dict[str, Any]:
-    # 1. Nodes
     nodes_dict = {}
     nodes = getattr(snap, "nodes", {})
     for n in nodes.values():
@@ -23,11 +22,9 @@ def snapshot_to_dict(snap: Snapshot) -> Dict[str, Any]:
             "labels": n.labels,
             "taints": n.taints,
             "is_virtual": n.is_virtual,
-            # NEW FIELD
             "uptime_hours_24h": float(n.uptime_hours_24h)
         }
 
-    # 2. Pods
     pods_dict = {}
     pods = getattr(snap, "pods", {})
     for p in pods.values():
@@ -57,7 +54,9 @@ def snapshot_to_dict(snap: Snapshot) -> Dict[str, Any]:
     return {
         "baseline": {"nodes": nodes_dict, "pods": pods_dict},
         "prices_by_instance": prices_map,
-        "keda_pool": getattr(snap, "keda_pool_name", None)
+        "keda_pool": getattr(snap, "keda_pool_name", None),
+        # SAVE HISTORY
+        "history_usage": getattr(snap, "history_usage", [])
     }
 
 def save_snapshot_to_file(snap: Snapshot, path: Path) -> None:

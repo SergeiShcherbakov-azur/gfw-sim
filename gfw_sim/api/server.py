@@ -130,9 +130,9 @@ def to_simulation_response(snapshot) -> SimulationResponse:
                 sum_req_cpu_m=row.sum_req_cpu_m,
                 sum_req_mem_b=row.sum_req_mem_b,
                 
-                # --- Передаем метрики usage ---
-                sum_usage_cpu_m=row.sum_usage_cpu_m,
-                sum_usage_mem_b=row.sum_usage_mem_b,
+                # --- FIX: Прокидываем usage в API ---
+                sum_usage_cpu_m=getattr(row, "sum_usage_cpu_m", 0),
+                sum_usage_mem_b=getattr(row, "sum_usage_mem_b", 0),
                 
                 ram_util_pct=row.ram_util_pct,
                 ram_ds_gib=row.ram_ds_gib,
@@ -155,9 +155,11 @@ def to_simulation_response(snapshot) -> SimulationResponse:
     for node_name, pods in sim.pods_by_node.items():
         items: List[PodViewModel] = []
         for p in pods:
+            # PodId во внутренней структуре PodView уже может быть строкой
+            pod_id = f"{p.namespace}/{p.name}"
             items.append(
                 PodViewModel(
-                    pod_id=f"{p.namespace}/{p.name}",
+                    pod_id=pod_id,
                     namespace=p.namespace,
                     name=p.name,
                     owner_kind=getattr(p, "owner_kind", None),
@@ -176,13 +178,15 @@ def to_simulation_response(snapshot) -> SimulationResponse:
             total_cost_daily_usd=sim.total_cost_daily_usd,
             total_cost_gfw_nodes_usd=sim.total_cost_gfw_nodes_usd,
             total_cost_keda_nodes_usd=sim.total_cost_keda_nodes_usd,
-            # --- Передаем стоимость пулов ---
-            pool_costs_usd=sim.pool_costs_usd
+            
+            # --- FIX: Прокидываем pool_costs ---
+            pool_costs_usd=getattr(sim, "pool_costs_usd", {})
         ),
         nodes=nodes,
         pods_by_node=pods_by_node,
         violations=violations,
     )
+
 # ---------------------------------------------------------------------------
 # Snapshot Manager
 # ---------------------------------------------------------------------------

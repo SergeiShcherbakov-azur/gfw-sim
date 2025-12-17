@@ -570,7 +570,8 @@
     btns.forEach(id => {
         if(el(id)) el(id).disabled = b;
     });
-    el("pillLoaded").textContent = b ? "loading…" : "ok";
+    const p = el("pillLoaded");
+    if(p) p.textContent = b ? "loading…" : "ok";
   }
   
   function setMsg(text, isErr=false){
@@ -1016,7 +1017,7 @@
     return s;
   }
   
-  // UPDATED SUMMARY LOGIC (Re-inserted)
+  // UPDATED SUMMARY LOGIC
   function applySummary(sim){
     const poolCosts = sim.summary?.pool_costs_usd || {};
     const summaryContainer = el("summaryBlock");
