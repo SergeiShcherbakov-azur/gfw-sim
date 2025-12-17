@@ -14,6 +14,7 @@ def _normalize_taints(taints_raw: Any) -> List[Dict[str, Any]]:
         return []
     result: List[Dict[str, Any]] = []
     for t in taints_raw:
+        # Если это уже dict (из JSON или collector'a)
         if isinstance(t, dict):
             result.append(
                 {
@@ -23,7 +24,7 @@ def _normalize_taints(taints_raw: Any) -> List[Dict[str, Any]]:
                 }
             )
         else:
-            # на случай, если внутри объект с атрибутами
+            # Если это объект (k8s python client entity)
             result.append(
                 {
                     "key": getattr(t, "key", None),
@@ -71,13 +72,7 @@ def _taint_tolerated(
 ) -> bool:
     """
     Проверяет, перекрывается ли конкретный taint одной из tolerations.
-    
-    Логика (согласно K8s docs):
-      1. Если key пустое (None) и operator "Exists" -> матчит все ключи/values/effects.
-      2. Если key совпадает:
-         - operator "Exists" -> матчит любой value.
-         - operator "Equal" (дефолт) -> value должно совпадать.
-      3. Effect должен совпадать (если в toleration он задан).
+    Поддерживает Wildcard (key=None + operator=Exists).
     """
     for tol in tolerations:
         t_key = tol.get("key")
@@ -87,21 +82,20 @@ def _taint_tolerated(
 
         # 1. Проверка Effect
         # Если effect в toleration задан, он должен строго совпадать.
-        # Если effect в toleration пуст (None/empty), он "tolerates all effects".
+        # Если effect пуст (None или ""), toleration работает для любых эффектов.
         if t_eff and effect and t_eff != effect:
             continue
 
         # 2. Проверка Key (и обработка Wildcard)
-        if t_key is None:
-            # Специфический случай K8s: если key не указан, operator должен быть Exists.
-            # Это означает, что toleration матчит любой taint key.
+        # Если ключ пустой (None или ""), это wildcard, ЕСЛИ operator == Exists
+        if not t_key: 
             if op == "Exists":
                 return True
             else:
-                # Некорректная конфигурация K8s (Empty key + Equal), пропускаем
+                # Некорректная конфигурация (пустой ключ без Exists) — игнорируем
                 continue
         
-        # Если key указан явно, он должен совпадать с ключом taint
+        # Если ключ задан явно, он должен совпадать
         if t_key != key:
             continue
 
@@ -110,13 +104,9 @@ def _taint_tolerated(
             return True
 
         if op == "Equal":
-            # Value должно совпадать
-            # Используем строковое сравнение для надежности
+            # Value должно совпадать как строка
             v1 = str(t_val) if t_val is not None else ""
             v2 = str(value) if value is not None else ""
-            
-            # В K8s значения case-sensitive, но для надежности сравнения в симуляции
-            # можно оставить точное совпадение v1 == v2.
             if v1 == v2:
                 return True
 
@@ -137,7 +127,7 @@ def _check_taints_and_tolerations(pod, node) -> List[str]:
         value = t.get("value")
         effect = t.get("effect") or "NoSchedule"
 
-        # интересны только жесткие эффекты
+        # Проверяем только "жесткие" эффекты, запрещающие скедулинг
         if effect not in ("NoSchedule", "NoExecute"):
             continue
 
@@ -285,7 +275,7 @@ def compute_violations(snapshot) -> Dict[str, List[Dict[str, Any]]]:
         node_violations: List[Dict[str, Any]] = []
 
         for pod_id, pod in pods.items():
-            # Проверяем только поды, назначенные на эту ноду
+            # Проверяем только поды, которые реально назначены на эту ноду
             if getattr(pod, "node", None) != node_name:
                 continue
 

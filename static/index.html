@@ -18,6 +18,9 @@
       --seg-ds:#ff7f0e;
       --seg-oth:#2ca02c;
       --seg-free:rgba(255,255,255,.16);
+      
+      --usage-ok: #9b59b6;   /* Purple for usage within bounds */
+      --usage-bad: #e74c3c;  /* Red for overcommit */
 
       --good:#2ecc71;
       --warn:#f1c40f;
@@ -128,7 +131,6 @@
     }
     .pill.red { border-color: rgba(231,76,60,.35); color: #ff6b6b; background: rgba(231,76,60,.1); }
 
-    /* --- Styles for Violations Panel --- */
     .viol-card {
       display: none;
       border: 1px solid rgba(231, 76, 60, 0.4);
@@ -255,19 +257,27 @@
     }
     .metric .topline .label{color:rgba(255,255,255,.75); font-weight:700; font-size:12px}
     .metric .topline .val{font-family:var(--mono); font-weight:800; font-size:12px}
+    
+    .bar-group {
+        display: flex; flex-direction: column; gap: 2px;
+    }
     .bar{
-      height:9px;
+      height:8px;
       border-radius:999px;
       overflow:hidden;
       border:1px solid rgba(255,255,255,.10);
       background:rgba(255,255,255,.06);
       display:flex;
     }
+    .bar.thin { height: 4px; border: none; background: rgba(255,255,255,0.03); }
+    
     .seg{height:100%}
     .seg.gfw{background:var(--seg-gfw)}
     .seg.ds{background:var(--seg-ds)}
     .seg.oth{background:var(--seg-oth)}
     .seg.free{background:var(--seg-free)}
+    .seg.usage{background:var(--usage-ok)}
+    .seg.over{background:var(--usage-bad)}
 
     .drop-hint{
       font-size:12px;
@@ -438,8 +448,8 @@
                   <th data-sort="node" class="col-node">Нода</th>
                   <th data-sort="nodepool">Nodepool</th>
                   <th data-sort="cost" class="right">$/день</th>
-                  <th data-sort="cpu">CPU (alloc / req)</th>
-                  <th data-sort="ram">RAM (alloc / req)</th>
+                  <th data-sort="cpu">CPU (req / use)</th>
+                  <th data-sort="ram">RAM (req / use)</th>
                 </tr>
               </thead>
               <tbody id="nodesBody"></tbody>
@@ -536,7 +546,7 @@
     selectedNode: null,
     sortKey: "gfw",
     sortDir: "desc",
-    pendingMove: null // { podId, targetNode, planData }
+    pendingMove: null
   };
 
   function fmtUsd(x){
@@ -647,14 +657,10 @@
   });
 
   // --- Modal Logic ---
-  
   function openModal(podId, targetNode, plan) {
       state.pendingMove = { podId, targetNode, plan };
-      
       el("mPodId").textContent = podId;
       el("mTargetNode").textContent = targetNode;
-      
-      // Setup Owner Checkbox
       if (plan.owner_name && plan.owner_kind) {
           el("mOwnerGroup").style.display = "flex";
           el("mCheckOwner").checked = false;
@@ -663,14 +669,10 @@
       } else {
           el("mOwnerGroup").style.display = "none";
       }
-
-      // Pre-fill Inputs
       el("mCpu").value = plan.current_req_cpu_m;
       el("mMem").value = plan.current_req_mem_b;
-      
       el("mTolerations").value = JSON.stringify(plan.suggested_tolerations, null, 2);
       el("mSelector").value = JSON.stringify(plan.suggested_node_selector, null, 2);
-      
       el("moveModalOverlay").style.display = "flex";
   }
   
@@ -681,10 +683,8 @@
   
   async function commitMove() {
       if (!state.pendingMove) return;
-      
       const { podId, targetNode, plan } = state.pendingMove;
       const isOwner = el("mCheckOwner").checked;
-      
       let req_cpu, req_mem, tols, sel;
       try {
           req_cpu = parseInt(el("mCpu").value);
@@ -695,46 +695,29 @@
           alert("Ошибка парсинга JSON или чисел: " + e.message);
           return;
       }
-
-      const overrides = {
-          req_cpu_m: req_cpu,
-          req_mem_b: req_mem,
-          tolerations: tols,
-          node_selector: sel
-      };
-      
-      // Находим NodePool целевой ноды
-      // Нам нужен target_pool для операции. Мы можем взять его из state.nodes
+      const overrides = { req_cpu_m: req_cpu, req_mem_b: req_mem, tolerations: tols, node_selector: sel };
       const targetNodeObj = state.nodes.find(n => n.node === targetNode);
       if (!targetNodeObj || !targetNodeObj.nodepool) {
           alert("Целевая нода не имеет пула!");
           return;
       }
       const targetPool = targetNodeObj.nodepool;
-
       let op = {};
       if (isOwner && plan.owner_name) {
           op = {
               op: "move_owner_to_pool",
-              namespace: podId.split("/")[0], // Грубо, но работает (namespace/name)
+              namespace: podId.split("/")[0],
               owner_kind: plan.owner_kind,
               owner_name: plan.owner_name,
               target_pool: targetPool,
               overrides: overrides
           };
       } else {
-          op = {
-              op: "move_pods_to_pool",
-              pod_ids: [podId],
-              target_pool: targetPool,
-              overrides: overrides
-          };
+          op = { op: "move_pods_to_pool", pod_ids: [podId], target_pool: targetPool, overrides: overrides };
       }
-      
       closeModal();
       setBusy(true);
       setMsg("Выполняется перенос...");
-      
       try {
           await apiMutateOne(op);
           await loadSim();
@@ -746,10 +729,9 @@
       }
   }
 
-
   // --- Render logic ---
 
-  function buildBar(parts, allocTotal){
+  function buildRequestBar(parts, allocTotal){
     const gfw = parts?.gfw ?? 0;
     const ds  = parts?.ds ?? 0;
     const oth = parts?.oth ?? 0;
@@ -774,6 +756,41 @@
     bar.appendChild(mk("ds", wD));
     bar.appendChild(mk("oth", wO));
     bar.appendChild(mk("free", wF));
+    return bar;
+  }
+
+  function buildUsageBar(usage, allocTotal) {
+    // Вторая полоска (overcommit)
+    // Показываем Usage vs Allocatable
+    // Если usage < alloc, то фиолетовая полоска
+    // Если usage > alloc, то фиолетовая до 100%, потом красная (overcommit)
+    
+    const denom = Math.max(1, allocTotal);
+    const usageVal = Math.max(0, usage);
+    const usagePct = 100 * usageVal / denom;
+
+    const bar = document.createElement("div");
+    bar.className = "bar thin"; // Более тонкая полоска
+    
+    if (usageVal <= allocTotal) {
+        // Usage is safe
+        const s = document.createElement("div");
+        s.className = "seg usage";
+        s.style.width = clampPct(usagePct).toFixed(3) + "%";
+        bar.appendChild(s);
+    } else {
+        // Overcommit!
+        // 1. Safe part (up to 100%)
+        const s1 = document.createElement("div");
+        s1.className = "seg usage";
+        s1.style.width = "100%"; // Full alloc used
+        
+        // Тут сложнее, визуально бар ограничен 100% ширины родителя.
+        // Чтобы показать overcommit, мы сделаем весь бар красным или частично?
+        // Обычно делают так: usage заполняет 100%, и цвет меняется на "bad".
+        s1.className = "seg over"; // Красная заливка на всю ширину
+        bar.appendChild(s1);
+    }
     return bar;
   }
 
@@ -820,45 +837,34 @@
     const keys = Object.keys(v);
     const card = el("violCard");
     const list = el("violList");
-    
     list.innerHTML = "";
-    
     if (!keys.length){
       card.style.display = "none";
       return;
     }
-    
     card.style.display = "block";
     el("violCount").textContent = String(keys.length);
-
     keys.sort((a,b) => v[b].length - v[a].length);
-
     for (const podId of keys.slice(0, 100)){
       const reasons = v[podId] || [];
-      
       const item = document.createElement("div");
       item.className = "viol-item";
-      
       const nameDiv = document.createElement("div");
       nameDiv.className = "viol-pod";
       nameDiv.textContent = podId;
       nameDiv.title = podId;
-      
       const msgsDiv = document.createElement("div");
       msgsDiv.className = "viol-msgs";
-      
       reasons.forEach(r => {
         const rDiv = document.createElement("span");
         rDiv.className = "viol-msg";
         rDiv.textContent = "• " + r;
         msgsDiv.appendChild(rDiv);
       });
-
       item.appendChild(nameDiv);
       item.appendChild(msgsDiv);
       list.appendChild(item);
     }
-    
     if (keys.length > 100) {
         const more = document.createElement("div");
         more.style.padding = "8px 12px";
@@ -884,24 +890,13 @@
       if (state.selectedNode && n.node === state.selectedNode){
         tr.classList.add("selected");
       }
-
-      tr.addEventListener("dragover", (e)=>{
-        e.preventDefault();
-        tr.classList.add("droptarget");
-      });
-      tr.addEventListener("dragleave", ()=>{
-        tr.classList.remove("droptarget");
-      });
-      
-      // DROP HANDLER (Updated)
+      tr.addEventListener("dragover", (e)=>{ e.preventDefault(); tr.classList.add("droptarget"); });
+      tr.addEventListener("dragleave", ()=>{ tr.classList.remove("droptarget"); });
       tr.addEventListener("drop", async (e)=>{
         e.preventDefault();
         tr.classList.remove("droptarget");
-        
         const podId = e.dataTransfer.getData("text/plain");
         if (!podId) return;
-        
-        // Вместо прямого вызова mutate, запрашиваем план
         try {
             setMsg("Анализ переноса...");
             const plan = await apiPost("/plan_move", { pod_id: podId, target_node: n.node });
@@ -911,7 +906,6 @@
             setMsg("Ошибка планирования: " + err.message, true);
         }
       });
-
       tr.addEventListener("click", ()=>{
         state.selectedNode = n.node;
         renderNodes();
@@ -937,37 +931,59 @@
       tdCost.className = "right mono";
       tdCost.textContent = fmtUsd(n.cost_daily_usd);
 
+      // CPU Column
       const tdCpu = document.createElement("td");
       const mCpu = document.createElement("div");
       mCpu.className = "metric";
       const topCpu = document.createElement("div");
       topCpu.className = "topline";
-      const l1 = document.createElement("span");
-      l1.className = "label";
-      l1.textContent = "CPU";
+      // Text: Req / Use
       const v1 = document.createElement("span");
       v1.className = "val";
-      v1.textContent = (n.alloc_cpu_m||0) + "m / " + (n.sum_req_cpu_m||0) + "m";
-      topCpu.appendChild(l1); topCpu.appendChild(v1);
+      // Format: "Req: 2000m / Use: 1500m" (alloc usually is implicit max)
+      // Or: "2000 / 1500 m"
+      v1.textContent = `${n.sum_req_cpu_m} / ${n.sum_usage_cpu_m || 0} m`;
+      topCpu.innerHTML = `<span class="label">CPU</span>`;
+      topCpu.appendChild(v1);
+      
+      const barsCpu = document.createElement("div");
+      barsCpu.className = "bar-group";
+      barsCpu.appendChild(buildRequestBar(nodeCpuParts(n), Math.max(1, n.alloc_cpu_m||1)));
+      if(n.sum_usage_cpu_m) {
+          barsCpu.appendChild(buildUsageBar(n.sum_usage_cpu_m, n.alloc_cpu_m));
+      }
+      
       mCpu.appendChild(topCpu);
-      mCpu.appendChild(buildBar(nodeCpuParts(n), Math.max(1, n.alloc_cpu_m||1)));
+      mCpu.appendChild(barsCpu);
       tdCpu.appendChild(mCpu);
 
+      // RAM Column
       const tdRam = document.createElement("td");
       const mRam = document.createElement("div");
       mRam.className = "metric";
       const topRam = document.createElement("div");
       topRam.className = "topline";
-      const l2 = document.createElement("span");
-      l2.className = "label";
-      l2.textContent = "RAM";
       const v2 = document.createElement("span");
       v2.className = "val";
-      v2.textContent = fmtMiB(n.alloc_mem_b||0) + " / " + fmtMiB(n.sum_req_mem_b||0) + " MiB";
-      topRam.appendChild(l2); topRam.appendChild(v2);
-      mRam.appendChild(topRam);
+      const reqMiB = fmtMiB(n.sum_req_mem_b||0);
+      const useMiB = fmtMiB(n.sum_usage_mem_b||0);
+      v2.textContent = `${reqMiB} / ${useMiB} MiB`;
+      topRam.innerHTML = `<span class="label">RAM</span>`;
+      topRam.appendChild(v2);
+
+      const barsRam = document.createElement("div");
+      barsRam.className = "bar-group";
       const memParts = nodeMemPartsMiB(n);
-      mRam.appendChild(buildBar(memParts, Math.max(1, (n.alloc_mem_b||0)/(1024*1024))));
+      const allocMiB = (n.alloc_mem_b||0)/(1024*1024);
+      const useMiBVal = (n.sum_usage_mem_b||0)/(1024*1024);
+      
+      barsRam.appendChild(buildRequestBar(memParts, Math.max(1, allocMiB)));
+      if(n.sum_usage_mem_b) {
+          barsRam.appendChild(buildUsageBar(useMiBVal, allocMiB));
+      }
+      
+      mRam.appendChild(topRam);
+      mRam.appendChild(barsRam);
       tdRam.appendChild(mRam);
 
       tr.appendChild(tdNode);
@@ -978,23 +994,6 @@
 
       tb.appendChild(tr);
     }
-
-    const headers = document.querySelectorAll("th[data-sort]");
-    headers.forEach(h=>{
-      if (h.dataset.bound) return;
-      h.dataset.bound = "1";
-      h.addEventListener("click", ()=>{
-        const k = h.getAttribute("data-sort");
-        if (!k) return;
-        if (state.sortKey === k){
-          state.sortDir = (state.sortDir === "asc") ? "desc" : "asc";
-        }else{
-          state.sortKey = k;
-          state.sortDir = (k === "gfw" || k === "cost" || k === "cpu" || k === "ram") ? "desc" : "asc";
-        }
-        renderNodes();
-      });
-    });
   }
 
   function renderPods(){
@@ -1003,11 +1002,7 @@
     el("selNode").textContent = node || "—";
     const tb = el("podsBody");
     tb.innerHTML = "";
-
-    if (!sim || !node){
-      el("podsCount").textContent = "0";
-      return;
-    }
+    if (!sim || !node){ el("podsCount").textContent = "0"; return; }
     const list = (sim.pods_by_node && sim.pods_by_node[node]) ? sim.pods_by_node[node] : [];
     el("podsCount").textContent = String(list.length);
 
@@ -1019,43 +1014,18 @@
         e.dataTransfer.setData("text/plain", p.pod_id);
         e.dataTransfer.effectAllowed = "move";
       });
-
-      const tdNs = document.createElement("td");
-      tdNs.className = "mono";
-      tdNs.textContent = p.namespace;
-
-      const tdName = document.createElement("td");
-      tdName.className = "mono";
-      tdName.title = p.name;
-      tdName.textContent = p.name;
-
-      const tdOwner = document.createElement("td");
-      tdOwner.className = "mono";
-      tdOwner.textContent = (p.owner_kind || "") + (p.owner_name ? "/" + p.owner_name : "");
-
-      const tdType = document.createElement("td");
-      tdType.textContent = p.is_daemon ? "DaemonSet" : "Workload";
-
-      const tdCpu = document.createElement("td");
-      tdCpu.className = "right mono";
-      tdCpu.textContent = String(p.req_cpu_m || 0);
-
-      const tdMem = document.createElement("td");
-      tdMem.className = "right mono";
-      tdMem.textContent = String(Math.round((p.req_mem_b || 0) / (1024*1024)));
-
+      const tdNs = document.createElement("td"); tdNs.className = "mono"; tdNs.textContent = p.namespace;
+      const tdName = document.createElement("td"); tdName.className = "mono"; tdName.title = p.name; tdName.textContent = p.name;
+      const tdOwner = document.createElement("td"); tdOwner.className = "mono"; tdOwner.textContent = (p.owner_kind || "") + (p.owner_name ? "/" + p.owner_name : "");
+      const tdType = document.createElement("td"); tdType.textContent = p.is_daemon ? "DaemonSet" : "Workload";
+      const tdCpu = document.createElement("td"); tdCpu.className = "right mono"; tdCpu.textContent = String(p.req_cpu_m || 0);
+      const tdMem = document.createElement("td"); tdMem.className = "right mono"; tdMem.textContent = String(Math.round((p.req_mem_b || 0) / (1024*1024)));
       const tdFlags = document.createElement("td");
       if (p.is_system) tdFlags.appendChild(tag("system","sys"));
       if (p.is_daemon) tdFlags.appendChild(tag("daemonset","ds"));
 
-      tr.appendChild(tdNs);
-      tr.appendChild(tdName);
-      tr.appendChild(tdOwner);
-      tr.appendChild(tdType);
-      tr.appendChild(tdCpu);
-      tr.appendChild(tdMem);
-      tr.appendChild(tdFlags);
-
+      tr.appendChild(tdNs); tr.appendChild(tdName); tr.appendChild(tdOwner);
+      tr.appendChild(tdType); tr.appendChild(tdCpu); tr.appendChild(tdMem); tr.appendChild(tdFlags);
       tb.appendChild(tr);
     }
   }
@@ -1066,20 +1036,17 @@
     s.textContent = txt;
     return s;
   }
-
   function applySummary(sim){
     el("sumAll").textContent = fmtUsd(sim.summary?.total_cost_daily_usd || 0);
     el("sumGfw").textContent = fmtUsd(sim.summary?.total_cost_gfw_nodes_usd || 0);
     el("sumKeda").textContent = fmtUsd(sim.summary?.total_cost_keda_nodes_usd || 0);
   }
-
   async function loadSim(){
     setBusy(true);
     try{
       const sim = await apiGet("/simulate");
       state.sim = sim;
       state.nodes = (sim.nodes || []).slice();
-
       if (!state.selectedNode){
         state.selectedNode = state.nodes.length ? state.nodes[0].node : null;
       }else{
@@ -1087,7 +1054,6 @@
           state.selectedNode = state.nodes.length ? state.nodes[0].node : null;
         }
       }
-
       applySummary(sim);
       renderViolations(sim);
       renderNodes();
@@ -1099,35 +1065,15 @@
       setBusy(false);
     }
   }
-
   el("btnRefresh").addEventListener("click", ()=>loadSim());
   el("btnReset").addEventListener("click", async ()=>{
-    try{
-      setBusy(true);
-      setMsg("Сбрасываю к baseline…");
-      await apiMutateOne({op:"reset_to_baseline"});
-      await loadSim();
-      setMsg("Сброшено к baseline.");
-    }catch(err){
-      setMsg("Ошибка reset: " + (err?.message || err), true);
-    }finally{
-      setBusy(false);
-    }
+    try{ setBusy(true); setMsg("Сбрасываю к baseline…"); await apiMutateOne({op:"reset_to_baseline"}); await loadSim(); setMsg("Сброшено к baseline."); }
+    catch(err){ setMsg("Ошибка reset: " + (err?.message || err), true); } finally{ setBusy(false); }
   });
   el("btnRefreshPrices").addEventListener("click", async ()=>{
-    try{
-      setBusy(true);
-      setMsg("Обновляю прайсы из AWS…");
-      await apiPost("/admin/refresh-prices", {});
-      await loadSim();
-      setMsg("Прайсы обновлены.");
-    }catch(err){
-      setMsg("Ошибка refresh-prices: " + (err?.message || err), true);
-    }finally{
-      setBusy(false);
-    }
+    try{ setBusy(true); setMsg("Обновляю прайсы из AWS…"); await apiPost("/admin/refresh-prices", {}); await loadSim(); setMsg("Прайсы обновлены."); }
+    catch(err){ setMsg("Ошибка refresh-prices: " + (err?.message || err), true); } finally{ setBusy(false); }
   });
-
   loadSnapshotsList().then(loadSim);
 </script>
 </body>

@@ -60,6 +60,10 @@ class Pod:
     node_selector: Dict[str, str] = field(default_factory=dict)
     affinity: Dict[str, Any] = field(default_factory=dict)
 
+    # Метрики потребления (Peak 1d)
+    usage_cpu_m: Optional[CpuMillis] = None
+    usage_mem_b: Optional[Bytes] = None
+
 
 @dataclass
 class InstancePrice:
