@@ -1,3 +1,4 @@
+# gfw_sim/sim/costs.py
 from __future__ import annotations
 
 import json
@@ -116,28 +117,11 @@ def refresh_prices_from_aws(instance_types: Iterable[str]) -> PricingState:
 # ---------------------------------------------------------------------
 
 
-def _effective_daily_hours_for_pool(nodepool: str) -> float:
-    """Возвращает эффективное количество часов работы ноды в сутки.
-
-    По умолчанию: 24 часа в сутки, 7 дней в неделю.
-
-    Для keda-nightly: учтено, что ноды работают только по будням
-    с 08:00 до 20:00 и выключены по ночам и в выходные.
-
-    Это даёт 5 * 12 = 60 часов в неделю
-    => 60 / 7 ≈ 8.57 часа в среднем в сутки.
-    """
-    pool = (nodepool or "").lower()
-    if "keda" in pool and "nightly" in pool:
-        hours_per_week = 12.0 * 5.0
-        return hours_per_week / 7.0
-    return 24.0
-
-
 def node_daily_cost_from_instance(instance_type: str, nodepool: str) -> tuple[float, bool]:
     """Стоимость ноды в день по типу инстанса и nodepool.
 
     Возвращает (стоимость_в_USD_в_день, price_missing).
+    Всегда считаем 24 часа (без учета расписаний).
     """
     state = get_state()
     hourly = state.hourly_prices.get(instance_type)
@@ -145,8 +129,8 @@ def node_daily_cost_from_instance(instance_type: str, nodepool: str) -> tuple[fl
     if hourly is None:
         hourly = 0.0
 
-    daily_hours = _effective_daily_hours_for_pool(nodepool)
-    daily_cost = hourly * daily_hours
+    # Убрали _effective_daily_hours_for_pool, теперь жестко 24 часа.
+    daily_cost = hourly * 24.0
     return daily_cost, missing
 
 

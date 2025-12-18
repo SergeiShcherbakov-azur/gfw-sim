@@ -202,7 +202,7 @@
       flex: 1 1 auto;
       min-height: 0;
       display:grid;
-      grid-template-columns: minmax(520px, 1.25fr) minmax(420px, 1fr);
+      grid-template-columns: minmax(520px, 1.25fr) minmax(450px, 1fr);
       gap:12px;
     }
 
@@ -426,7 +426,7 @@
                 <tr>
                   <th data-sort="node" class="col-node">Нода</th>
                   <th data-sort="nodepool">Nodepool</th>
-                  <th data-sort="cost" class="right">$/день (Run Rate)</th>
+                  <th data-sort="cost" class="right">$/день (24h)</th>
                   <th data-sort="cpu">CPU (req / use)</th>
                   <th data-sort="ram">RAM (req / use)</th>
                 </tr>
@@ -453,8 +453,7 @@
                 <tr>
                   <th class="nosort">Namespace</th>
                   <th class="nosort">Pod</th>
-                  <th class="nosort">Owner</th>
-                  <th class="nosort">Type</th>
+                  <th class="nosort right">Active</th> <th class="nosort">Type</th>
                   <th class="nosort right">CPU (m)</th>
                   <th class="nosort right">RAM (MiB)</th>
                   <th class="nosort">Flags</th>
@@ -740,11 +739,6 @@
   }
 
   function buildUsageBar(usage, allocTotal) {
-    // Вторая полоска (overcommit)
-    // Показываем Usage vs Allocatable
-    // Если usage < alloc, то фиолетовая полоска
-    // Если usage > alloc, то фиолетовая до 100%, потом красная (overcommit)
-    
     const denom = Math.max(1, allocTotal);
     const usageVal = Math.max(0, usage);
     const usagePct = 100 * usageVal / denom;
@@ -765,9 +759,6 @@
         s1.className = "seg usage";
         s1.style.width = "100%"; // Full alloc used
         
-        // Тут сложнее, визуально бар ограничен 100% ширины родителя.
-        // Чтобы показать overcommit, мы сделаем весь бар красным или частично?
-        // Обычно делают так: usage заполняет 100%, и цвет меняется на "bad".
         s1.className = "seg over"; // Красная заливка на всю ширину
         bar.appendChild(s1);
     }
@@ -996,7 +987,20 @@
       });
       const tdNs = document.createElement("td"); tdNs.className = "mono"; tdNs.textContent = p.namespace;
       const tdName = document.createElement("td"); tdName.className = "mono"; tdName.title = p.name; tdName.textContent = p.name;
-      const tdOwner = document.createElement("td"); tdOwner.className = "mono"; tdOwner.textContent = (p.owner_kind || "") + (p.owner_name ? "/" + p.owner_name : "");
+      
+      // NEW: Active Column
+      const tdActive = document.createElement("td");
+      tdActive.className = "right mono";
+      const ratio = p.active_ratio !== undefined ? p.active_ratio : 1.0;
+      const hours = (ratio * 24).toFixed(1);
+      const pct = (ratio * 100).toFixed(0);
+      let color = "var(--text)";
+      if (ratio < 0.95) color = "#f1c40f"; // Yellow if part-time
+      if (ratio < 0.55) color = "#2ecc71"; // Green if significant savings
+      
+      tdActive.style.color = color;
+      tdActive.innerHTML = `${hours}h <span style="opacity:0.5;font-size:11px">(${pct}%)</span>`;
+
       const tdType = document.createElement("td"); tdType.textContent = p.is_daemon ? "DaemonSet" : "Workload";
       const tdCpu = document.createElement("td"); tdCpu.className = "right mono"; tdCpu.textContent = String(p.req_cpu_m || 0);
       const tdMem = document.createElement("td"); tdMem.className = "right mono"; tdMem.textContent = String(Math.round((p.req_mem_b || 0) / (1024*1024)));
@@ -1004,8 +1008,13 @@
       if (p.is_system) tdFlags.appendChild(tag("system","sys"));
       if (p.is_daemon) tdFlags.appendChild(tag("daemonset","ds"));
 
-      tr.appendChild(tdNs); tr.appendChild(tdName); tr.appendChild(tdOwner);
-      tr.appendChild(tdType); tr.appendChild(tdCpu); tr.appendChild(tdMem); tr.appendChild(tdFlags);
+      tr.appendChild(tdNs); 
+      tr.appendChild(tdName);
+      tr.appendChild(tdActive); // Insert new col
+      tr.appendChild(tdType); 
+      tr.appendChild(tdCpu); 
+      tr.appendChild(tdMem); 
+      tr.appendChild(tdFlags);
       tb.appendChild(tr);
     }
   }
@@ -1019,24 +1028,64 @@
   
   // UPDATED SUMMARY LOGIC
   function applySummary(sim){
-    const poolCosts = sim.summary?.pool_costs_usd || {};
-    const summaryContainer = el("summaryBlock");
-    summaryContainer.innerHTML = "";
+    const histPools = sim.summary?.pool_costs_usd || {};
+    const projPools = sim.summary?.projected_pool_costs_usd || {};
+    const histTotal = sim.summary?.total_cost_daily_usd || 0;
+    const projTotal = sim.summary?.projected_total_cost_usd || 0;
+    
+    const container = el("summaryBlock");
+    container.innerHTML = "";
 
-    // Total Cost Card
-    const totalCard = document.createElement("div");
-    totalCard.className = "card";
-    totalCard.innerHTML = `<div class="hdr"><h3>Projected Daily Cost</h3><span class="pill" id="pillLoaded">ok</span></div><div class="body"><div class="big" id="sumAll">${fmtUsd(sim.summary?.total_cost_daily_usd || 0)}</div><div class="muted">Based on current node count * 24h</div></div>`;
-    summaryContainer.appendChild(totalCard);
+    // 1. Total Card
+    const diffTotal = projTotal - histTotal;
+    const signTotal = diffTotal > 0 ? "+" : "";
+    const colorTotal = diffTotal > 0.01 ? "#e74c3c" : (diffTotal < -0.01 ? "#2ecc71" : "rgba(255,255,255,0.5)");
+    
+    const cardTotal = document.createElement("div");
+    cardTotal.className = "card";
+    cardTotal.innerHTML = `
+      <div class="hdr"><h3>Total Daily Cost</h3><span class="pill" id="pillLoaded">ok</span></div>
+      <div class="body">
+        <div class="big">${fmtUsd(histTotal)} <span style="font-size:14px;color:var(--muted)">ACTUAL</span></div>
+        <div style="margin-top:4px; font-size:13px; font-family:var(--mono); color:var(--text)">
+           Projected: ${fmtUsd(projTotal)} 
+           <span style="color:${colorTotal}">(${signTotal}${fmtUsd(diffTotal)})</span>
+        </div>
+      </div>`;
+    container.appendChild(cardTotal);
 
-    // Dynamic cards for each pool (sorted by cost descending)
-    const pools = Object.keys(poolCosts).sort((a,b) => poolCosts[b] - poolCosts[a]);
-    pools.forEach(pool => {
-        const cost = poolCosts[pool];
+    // 2. Pools
+    const allPools = new Set([...Object.keys(histPools), ...Object.keys(projPools)]);
+    const sorted = Array.from(allPools).sort((a,b) => (histPools[b]||0) - (histPools[a]||0));
+
+    sorted.forEach(pool => {
+        const h = histPools[pool] || 0;
+        const p = projPools[pool] || 0;
+        const d = p - h;
+        const s = d > 0 ? "+" : "";
+        const c = Math.abs(d) > 0.001 ? (d > 0 ? "#e74c3c" : "#2ecc71") : "rgba(255,255,255,0.3)";
+        
+        let mainVal = fmtUsd(h);
+        let subText = `<span style="color:${c}">${s}${fmtUsd(d)}</span>`;
+        
+        if (h === 0) {
+             mainVal = fmtUsd(p);
+             subText = `<span style="color:var(--muted)">New (Sim)</span>`;
+        } else if (p === 0) {
+             subText = `<span style="color:#2ecc71">(-${fmtUsd(h)})</span>`;
+        }
+
         const card = document.createElement("div");
         card.className = "card";
-        card.innerHTML = `<div class="hdr"><h3>${pool}</h3><span class="pill">24h actual</span></div><div class="body"><div class="big">${fmtUsd(cost)}</div><div class="muted">Cost over last 24h (based on uptime)</div></div>`;
-        summaryContainer.appendChild(card);
+        card.innerHTML = `
+          <div class="hdr"><h3>${pool}</h3></div>
+          <div class="body">
+            <div class="big">${mainVal}</div>
+            <div style="margin-top:4px; font-size:12px; font-family:var(--mono);">
+               Proj: ${fmtUsd(p)} (${subText})
+            </div>
+          </div>`;
+        container.appendChild(card);
     });
   }
 
@@ -1064,7 +1113,7 @@
       setBusy(false);
     }
   }
-  el("btnRefresh").addEventListener("click", ()=>loadSim());
+  el("btnRefresh").addEventListener("click", loadSim);
   el("btnReset").addEventListener("click", async ()=>{
     try{ setBusy(true); setMsg("Сбрасываю к baseline…"); await apiMutateOne({op:"reset_to_baseline"}); await loadSim(); setMsg("Сброшено к baseline."); }
     catch(err){ setMsg("Ошибка reset: " + (err?.message || err), true); } finally{ setBusy(false); }
@@ -1073,6 +1122,37 @@
     try{ setBusy(true); setMsg("Обновляю прайсы из AWS…"); await apiPost("/admin/refresh-prices", {}); await loadSim(); setMsg("Прайсы обновлены."); }
     catch(err){ setMsg("Ошибка refresh-prices: " + (err?.message || err), true); } finally{ setBusy(false); }
   });
+  el("selSnapshots").addEventListener("change", async (e) => {
+      const id = e.target.value;
+      setBusy(true);
+      try {
+          await apiPost(`/snapshots/${id}/activate`);
+          await loadSim();
+          setMsg(`Switched to snapshot: ${id}`);
+      } catch(err) {
+          setMsg("Error switching: " + err, true);
+      } finally {
+          setBusy(false);
+      }
+  });
+  el("btnCapture").addEventListener("click", async () => {
+      if(!confirm("Собрать текущее состояние кластера?")) return;
+      setBusy(true);
+      setMsg("Connecting to K8s & capturing state...");
+      try {
+          const res = await apiPost("/snapshots/capture");
+          await loadSnapshotsList();
+          el("selSnapshots").value = res.id;
+          await apiPost(`/snapshots/${res.id}/activate`);
+          await loadSim();
+          setMsg("Snapshot captured successfully!");
+      } catch(err) {
+          setMsg("Capture failed: " + (err.message||err), true);
+      } finally {
+          setBusy(false);
+      }
+  });
+
   loadSnapshotsList().then(loadSim);
 </script>
 </body>
