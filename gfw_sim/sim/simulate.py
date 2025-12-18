@@ -82,21 +82,25 @@ def run_simulation(snapshot) -> SimulationResult:
     history = getattr(snapshot, "history_usage", [])
     pool_costs_usd: Dict[str, float] = {}
     
+    # ВАЖНО: Получаем доступ к сырым ценам
+    pricing_state = costs.get_state()
+    
     if history:
         for entry in history:
             pool = entry.get("pool", "unknown")
             inst = entry.get("instance", "unknown")
             hours = entry.get("instance_hours_24h", 0.0)
             
-            # Получаем цену за час
-            daily, _ = costs.node_daily_cost_from_instance(inst, pool)
-            hourly_price = daily / 24.0
+            # ИСПРАВЛЕНИЕ: Используем сырую цену часа (On-Demand).
+            # Не используем node_daily_cost_from_instance, так как она применяет 
+            # коэффициенты расписания (например, 12/24), которые уже учтены в реальном hours.
+            hourly_price = pricing_state.hourly_prices.get(inst, 0.0)
             
             cost = hourly_price * hours
             pool_costs_usd[pool] = pool_costs_usd.get(pool, 0.0) + cost
             
     # 2. Считаем текущие ноды (таблица)
-    total_cost_daily_projected = 0.0 # Это по-прежнему будет Run Rate текущего снапшота
+    total_cost_daily_projected = 0.0 
 
     for node in _iter_snapshot_nodes(snapshot):
         node_name = getattr(node, "name", "") or ""
@@ -122,10 +126,11 @@ def run_simulation(snapshot) -> SimulationResult:
         sum_usage_cpu_m = sum((getattr(p, "usage_cpu_m", 0) or 0) for p in node_pods_raw)
         sum_usage_mem_b = sum((getattr(p, "usage_mem_b", 0) or 0) for p in node_pods_raw)
 
+        # Для таблицы (Run Rate) оставляем старый расчет "будущего" с учетом расписания
         cost_daily_usd, price_missing = costs.node_daily_cost_from_instance(instance_type, nodepool)
         total_cost_daily_projected += cost_daily_usd
         
-        # Если истории не было, фоллбечимся на простой расчет по текущим нодам
+        # Если истории не было (фоллбек), заполняем pool_costs_usd прогнозными данными
         if not history:
             pool_costs_usd[nodepool] = pool_costs_usd.get(nodepool, 0.0) + cost_daily_usd
 
@@ -143,13 +148,12 @@ def run_simulation(snapshot) -> SimulationResult:
         )
         nodes_table.append(row)
 
-    # Используем сумму из pool_costs_usd как Total, если история есть, так точнее
     total_cost_from_pools = sum(pool_costs_usd.values())
 
     return SimulationResult(
         nodes_table=nodes_table, pods_by_node=pods_by_node,
-        total_cost_daily_usd=total_cost_from_pools, # Теперь Total соответствует сумме карточек
-        total_cost_gfw_nodes_usd=0.0, # Deprecated fields
+        total_cost_daily_usd=total_cost_from_pools,
+        total_cost_gfw_nodes_usd=0.0,
         total_cost_keda_nodes_usd=0.0,
         pool_costs_usd=pool_costs_usd
     )

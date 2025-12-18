@@ -4,10 +4,11 @@ from __future__ import annotations
 import logging
 import re
 import json
+import os
 import subprocess
 import requests
-from datetime import datetime, timezone
-from typing import Dict, List, Any
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Any, Optional
 
 from kubernetes import client, config
 
@@ -19,7 +20,6 @@ from ..types import (
 log = logging.getLogger(__name__)
 
 VM_URL = "https://victoria-metrics-cluster.infra.prod.aws.eu-central-1.azurgames.dev/select/0/prometheus/api/v1/query"
-DEFAULT_SCRAPE_INTERVAL = 30.0
 
 def parse_cpu(quantity: str | None) -> CpuMillis:
     if not quantity: return CpuMillis(0)
@@ -55,40 +55,26 @@ def _run_kubectl(args: List[str], context: str | None) -> Dict[str, Any]:
         raise
 
 def _get_query_timestamp() -> int:
-    """Timestamp начала текущего дня (00:00:00 UTC)."""
+    """
+    Возвращает timestamp (int) конца периода выборки (00:00:00 UTC целевого дня).
+    По умолчанию: 00:00:00 UTC сегодня (выборка за вчера).
+    Можно переопределить через ENV 'GFW_SNAPSHOT_DATE' (YYYY-MM-DD), чтобы выбрать конкретный день.
+    """
+    env_date = os.getenv("GFW_SNAPSHOT_DATE")
+    if env_date:
+        try:
+            # Если задана дата 2025-12-16, мы хотим данные за весь этот день.
+            # Значит, нам нужно окно [1d] заканчивающееся в 2025-12-17 00:00:00 UTC.
+            dt = datetime.strptime(env_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            target = dt + timedelta(days=1)
+            log.info(f"Using forced date from env: {env_date}. Query end time: {target}")
+            return int(target.timestamp())
+        except ValueError:
+            log.error(f"Invalid GFW_SNAPSHOT_DATE format: {env_date}. Expected YYYY-MM-DD. Using default.")
+    
     now = datetime.now(timezone.utc)
     today_midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return int(today_midnight.timestamp())
-
-def _detect_scrape_interval() -> float:
-    """
-    Определяет интервал сбора метрик (Scrape Interval), анализируя плотность точек.
-    Это нужно, чтобы правильно перевести количество точек (count_over_time) в секунды.
-    """
-    ts = _get_query_timestamp()
-    # Берем стабильную метрику за 1 час
-    q = 'count_over_time(up{job="kubelet", cluster="shared-dev"}[1h])'
-    try:
-        resp = requests.get(VM_URL, params={"query": q, "time": ts}, timeout=10)
-        resp.raise_for_status()
-        data = resp.json().get("data", {}).get("result", [])
-        if data:
-            # Берем медианное значение количества точек
-            counts = [float(r["value"][1]) for r in data]
-            if not counts: return DEFAULT_SCRAPE_INTERVAL
-            avg_count = sum(counts) / len(counts)
-            
-            if avg_count > 0:
-                interval = 3600.0 / avg_count
-                # Округляем до стандартных значений
-                if 10 <= interval <= 20: return 15.0
-                if 25 <= interval <= 35: return 30.0
-                if 55 <= interval <= 65: return 60.0
-                return interval
-    except Exception as e:
-        log.warning(f"Could not detect scrape interval: {e}")
-    
-    return DEFAULT_SCRAPE_INTERVAL
 
 def _collect_vm_metrics() -> Dict[str, Dict[str, float]]:
     results: Dict[str, Dict[str, float]] = {}
@@ -125,76 +111,171 @@ def _collect_vm_metrics() -> Dict[str, Dict[str, float]]:
     
     return results
 
+def _collect_aws_metadata(region="eu-central-1", profile: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Запрашивает метаданные из AWS API: Lifecycle (Spot/OnDemand) и LaunchTime.
+    """
+    try:
+        cmd = [
+            "aws", "ec2", "describe-instances",
+            "--region", region,
+            "--filters", "Name=instance-state-name,Values=running",
+            "--query", "Reservations[].Instances[].{Name:PrivateDnsName, Lifecycle:InstanceLifecycle, LaunchTime:LaunchTime}",
+            "--output", "json"
+        ]
+        
+        if profile:
+            cmd.extend(["--profile", profile])
+            
+        log.info(f"Fetching AWS EC2 metadata (profile={profile})...")
+        res = subprocess.check_output(cmd, stderr=subprocess.PIPE)
+        data = json.loads(res)
+        
+        result = {}
+        now = datetime.now(timezone.utc)
+        
+        for item in data:
+            name = item.get("Name")
+            if not name: continue
+            
+            lifecycle = item.get("Lifecycle") or "on_demand"
+            launch_time_str = item.get("LaunchTime")
+            uptime_hours = 24.0
+            
+            if launch_time_str:
+                try:
+                    lt = datetime.fromisoformat(launch_time_str.replace("Z", "+00:00"))
+                    delta = now - lt
+                    uptime_hours = min(24.0, delta.total_seconds() / 3600.0)
+                except Exception:
+                    pass
+
+            result[name] = {
+                "capacity_type": lifecycle,
+                "uptime_hours": uptime_hours
+            }
+            
+        log.info(f"Collected AWS metadata for {len(result)} instances.")
+        return result
+    except subprocess.CalledProcessError as e:
+        log.error(f"AWS CLI failed: {e.stderr.decode('utf-8', errors='ignore')}")
+        return {}
+    except Exception as e:
+        log.error(f"Unexpected error collecting AWS metadata: {e}")
+        return {}
+
 def _collect_historical_usage() -> List[Dict[str, Any]]:
     """
-    Считает суммарное время работы (Instance-Hours) за вчерашние сутки.
-    Использует count_over_time * scrape_interval для точности.
+    Считает суммарное время работы (Instance-Hours) за ВЧЕРАШНИЕ сутки.
+    Реализует JOIN на стороне Python для максимальной надежности.
     """
     history = []
     ts = _get_query_timestamp()
     
-    interval = _detect_scrape_interval()
-    log.info(f"Detected metrics scrape interval: {interval}s")
+    start_dt = datetime.fromtimestamp(ts - 86400, tz=timezone.utc)
+    end_dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+    log.info(f"Querying history for window: {start_dt} -> {end_dt} (UTC)")
     
-    # Считаем количество сэмплов "Ready" статуса за 24 часа.
-    # Это работает и для исчезнувших нод (count просто вернет меньше точек).
-    q = """
+    # 1. Запрашиваем Usage (Часы работы по нодам)
+    # Используем 'up' от kubelet, так как он есть всегда, пока нода жива.
+    # max by (node) убирает дубликаты.
+    # [1d:1m] нормализует в минуты.
+    q_usage = """
     sum(
-      count_over_time(
-        kube_node_status_condition{
-          condition="Ready", status="true", 
-          cluster="shared-dev"
-        }[24h]
+      sum_over_time(
+        (max by (node) (up{job="kubelet", cluster="shared-dev"} == 1))[1d:1m]
       )
-    ) by (node)
-    * on(node) group_left(label_karpenter_sh_nodepool, label_node_kubernetes_io_instance_type)
-    kube_node_labels{
-      cluster="shared-dev",
-      label_node_kubernetes_io_instance_type!=""
-    }
+    ) by (node) / 60
     """
     
+    # 2. Запрашиваем Metadata (Лейблы по нодам)
+    # last_over_time находит последние известные лейблы за сутки.
+    q_meta = """
+    last_over_time(
+      kube_node_labels{
+        cluster="shared-dev",
+        label_karpenter_sh_nodepool!=""
+      }[1d]
+    )
+    """
+    
+    node_usage_map: Dict[str, float] = {}
+    node_meta_map: Dict[str, Dict[str, str]] = {}
+    
     try:
-        clean_q = re.sub(r'\s+', ' ', q).strip()
-        log.info(f"Querying history with time={ts}")
-        
-        resp = requests.get(VM_URL, params={"query": clean_q, "time": ts}, timeout=30)
+        # Fetch Usage
+        clean_q_usage = re.sub(r'\s+', ' ', q_usage).strip()
+        log.info(f"Querying per-node usage (metric: up)...")
+        resp = requests.get(VM_URL, params={"query": clean_q_usage, "time": ts}, timeout=60)
         resp.raise_for_status()
-        data = resp.json().get("data", {}).get("result", [])
-        
-        for r in data:
+        for r in resp.json().get("data", {}).get("result", []):
+            node = r.get("metric", {}).get("node")
+            try:
+                hours = float(r.get("value", [0, "0"])[1])
+                if node and hours > 0:
+                    node_usage_map[node] = hours
+            except ValueError: pass
+
+        # Fetch Metadata
+        clean_q_meta = re.sub(r'\s+', ' ', q_meta).strip()
+        log.info(f"Querying per-node metadata...")
+        resp = requests.get(VM_URL, params={"query": clean_q_meta, "time": ts}, timeout=60)
+        resp.raise_for_status()
+        for r in resp.json().get("data", {}).get("result", []):
             metric = r.get("metric", {})
-            val = r.get("value", [0, "0"])[1]
-            
+            node = metric.get("node")
             pool = metric.get("label_karpenter_sh_nodepool")
             inst = metric.get("label_node_kubernetes_io_instance_type")
+            if node and pool:
+                node_meta_map[node] = {
+                    "pool": pool,
+                    "instance": inst or "unknown"
+                }
+
+        # Python Join & Aggregate
+        aggregated: Dict[tuple, float] = {}
+        missing_meta_count = 0
+        
+        for node, hours in node_usage_map.items():
+            meta = node_meta_map.get(node)
+            if not meta:
+                # Попробуем найти ноду без домена, если метрики отличаются
+                short_name = node.split('.')[0]
+                for k, v in node_meta_map.items():
+                    if k.startswith(short_name):
+                        meta = v
+                        break
             
-            if not pool: pool = "unknown"
-            if not inst: inst = "unknown"
+            if not meta:
+                missing_meta_count += 1
+                continue 
+
+            pool = meta["pool"]
+            inst = meta["instance"]
+            key = (pool, inst)
+            aggregated[key] = aggregated.get(key, 0.0) + hours
             
-            try:
-                samples_count = float(val)
-                # Переводим сэмплы в часы
-                hours = (samples_count * interval) / 3600.0
-                
-                if hours > 0:
-                    history.append({
-                        "pool": pool,
-                        "instance": inst,
-                        "instance_hours_24h": hours
-                    })
-            except ValueError:
-                pass
-                
-        log.info(f"Collected history for {len(history)} groups.")
+        if missing_meta_count > 0:
+            log.warning(f"Skipped {missing_meta_count} nodes due to missing metadata (labels).")
+
+        for (pool, inst), hours in aggregated.items():
+            history.append({
+                "pool": pool,
+                "instance": inst,
+                "instance_hours_24h": hours
+            })
+            
+        log.info(f"Collected history: {len(history)} groups processed from {len(node_usage_map)} nodes.")
+        
     except Exception as e:
         log.warning(f"History collection failed: {e}")
         
     return history
 
-def _collect_via_kubectl(context: str | None) -> Snapshot:
+def _collect_via_kubectl(context: str | None, aws_profile: str | None) -> Snapshot:
     metrics_map = _collect_vm_metrics()
     history_data = _collect_historical_usage()
+    aws_meta = _collect_aws_metadata(profile=aws_profile)
 
     log.info("Fetching Nodes via kubectl...")
     nodes_data = _run_kubectl(["get", "nodes"], context).get("items", [])
@@ -241,10 +322,16 @@ def _collect_via_kubectl(context: str | None) -> Snapshot:
         
         node_taints = [{"key": t.get("key"), "value": t.get("value"), "effect": t.get("effect")} for t in spec.get("taints", [])]
         
+        am = aws_meta.get(name, {})
+        real_uptime = am.get("uptime_hours", 24.0)
+        real_capacity = am.get("capacity_type", "on_demand")
+        
         nodes[NodeId(name)] = Node(
             id=NodeId(name), name=name, nodepool=pool_name, instance_type=InstanceType(instance_type),
             alloc_cpu_m=parse_cpu(alloc.get("cpu")), alloc_mem_b=parse_memory(alloc.get("memory")),
-            labels=labels, taints=node_taints, uptime_hours_24h=24.0 # Заглушка, используем history_usage
+            capacity_type=real_capacity,
+            labels=labels, taints=node_taints, 
+            uptime_hours_24h=real_uptime
         )
 
     pods: Dict[PodId, Pod] = {}
@@ -270,6 +357,9 @@ def _collect_via_kubectl(context: str | None) -> Snapshot:
         tols = [{"key": t.get("key"), "operator": t.get("operator"), "value": t.get("value"), "effect": t.get("effect")} for t in spec.get("tolerations", [])]
         
         usage = metrics_map.get(str(pod_id), {})
+        u_cpu = CpuMillis(int(usage.get("cpu_m", 0))) if "cpu_m" in usage else None
+        u_mem = Bytes(int(usage.get("mem_b", 0))) if "mem_b" in usage else None
+        
         pods[pod_id] = Pod(
             id=pod_id, name=meta.get("name"), namespace=Namespace(meta.get("namespace")),
             node=NodeId(node_name) if node_name in nodes else None,
@@ -294,11 +384,11 @@ def _create_snapshot_result(nodes, pods, nodepools, history) -> Snapshot:
         history_usage=history
     )
 
-def collect_k8s_snapshot(k8s_context: str | None = None, method: str = "kubectl") -> Snapshot:
+def collect_k8s_snapshot(k8s_context: str | None = None, method: str = "kubectl", aws_profile: str | None = "shared-dev") -> Snapshot:
     if method == "kubectl":
         try:
-            return _collect_via_kubectl(k8s_context)
+            return _collect_via_kubectl(k8s_context, aws_profile)
         except Exception as e:
             log.error(f"kubectl failed: {e}, falling back...")
-            return _collect_via_kubectl(k8s_context)
-    return _collect_via_kubectl(k8s_context)
+            return _collect_via_kubectl(k8s_context, aws_profile)
+    return _collect_via_kubectl(k8s_context, aws_profile)
