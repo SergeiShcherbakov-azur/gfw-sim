@@ -10,62 +10,64 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from ..model.entities import Snapshot, NodePool
+from ..snapshot.io import load_snapshot_from_file, save_snapshot_to_file
 from ..snapshot.from_legacy import snapshot_from_legacy_data
 from ..snapshot.collector import collect_k8s_snapshot
-from ..snapshot.io import save_snapshot_to_file, load_snapshot_from_file
-from ..sim.simulate import run_simulation
-
+from ..sim import simulate, costs as sim_costs, constraints
+from ..model.entities import Snapshot, NodePool
 from ..sim.operations import (
-    move_namespace_to_pool,
-    move_owner_to_pool,
-    move_node_pods_to_pool,
-    delete_pods,
-    delete_namespace,
-    delete_owner,
-    patch_pods_in_snapshot,
+    move_namespace_to_pool, move_owner_to_pool, move_node_pods_to_pool,
+    move_pods_to_pool, delete_pods, delete_namespace, delete_owner, patch_pods_in_snapshot
 )
-from ..sim.constraints import check_all_placements
-from ..sim import costs as sim_costs
 from ..types import NodePoolName, PodId, NodeId
 from .schema import (
-    SimulationResponse,
-    SimulationSummaryModel,
-    NodeRowModel,
-    NodePartsModel,
-    PodViewModel,
-    MutateRequest,
-    OperationModel,
-    PlanMoveRequest,
-    PlanMoveResponse,
+    SimulationResponse, SimulationSummaryModel, NodeRowModel, NodePartsModel,
+    PodViewModel, MutateRequest, OperationModel, PlanMoveRequest, PlanMoveResponse,
+    PoolCostModel
 )
-from ..sim.packing import move_pods_to_pool
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 log = logging.getLogger("uvicorn")
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+# --- PATHS ---
+MODULE_ROOT = Path(__file__).resolve().parent.parent 
+PROJECT_ROOT = MODULE_ROOT.parent    # repo root
+STATIC_DIR = PROJECT_ROOT / "static" # points to /static in repo root
+SNAPSHOTS_DIR = PROJECT_ROOT / "snapshots"
+LEGACY_PATH = MODULE_ROOT / "snapshot" / "legacy.json"
+
+CURRENT_SNAPSHOT: Snapshot | None = None
+
+# --- Helpers ---
 
 def _iter_nodes(snapshot: Snapshot):
     nodes = getattr(snapshot, "nodes", [])
-    if isinstance(nodes, dict):
-        return nodes.values()
+    if isinstance(nodes, dict): return nodes.values()
     return nodes
 
 def _clone_snapshot(snapshot: Snapshot) -> Snapshot:
-    if snapshot is None:
-        return None
+    if snapshot is None: return None
     return copy.deepcopy(snapshot)
 
 def _prune_nodes_only_daemonsets(snapshot: Snapshot) -> Snapshot:
     if snapshot is None: return snapshot
     nodes = getattr(snapshot, "nodes", {})
     pods = getattr(snapshot, "pods", {})
+    if not isinstance(nodes, dict) or not isinstance(pods, dict): return snapshot
     if not nodes: return snapshot
 
     keep_nodes = set()
@@ -75,19 +77,14 @@ def _prune_nodes_only_daemonsets(snapshot: Snapshot) -> Snapshot:
         if getattr(p, "is_daemonset", False): continue
         keep_nodes.add(n)
 
-    to_delete = [n for n in nodes.keys() if n not in keep_nodes]
+    to_delete = [n for n in list(nodes.keys()) if n not in keep_nodes]
     for n in to_delete:
         nodes.pop(n, None)
-
-    # Clean orphaned pods
+        
     for pid, p in list(pods.items()):
         n = getattr(p, "node", None)
         if n and n not in nodes:
-             # Pod references deleted node? 
-             # For simulation consistency, we might want to keep pod but unassigned?
-             # Or delete it? Pruning usually implies cleaning up empty nodes.
-             # Pods on those nodes are likely gone or irrelevant.
-             pass
+             p.node = None 
 
     return snapshot
 
@@ -98,11 +95,63 @@ def _pick_instance_type(node) -> str:
             if v: return v
     return ""
 
-def to_simulation_response(snapshot) -> SimulationResponse:
-    sim = run_simulation(snapshot)
+def _ensure_history(snapshot: Snapshot):
+    if not snapshot: return
+    history = getattr(snapshot, "history_usage", [])
+    if history: return 
+
+    new_hist = []
+    nodes = getattr(snapshot, "nodes", {})
+    agg = {}
+    for n in nodes.values():
+        pool = getattr(n, "nodepool", "default")
+        inst = getattr(n, "instance_type", "unknown")
+        key = (str(pool), str(inst))
+        agg[key] = agg.get(key, 0.0) + 24.0
     
-    raw_violations = check_all_placements(snapshot)
-    violations: Dict[str, List[str]] = {}
+    for (p, i), hours in agg.items():
+        new_hist.append({
+            "pool": p,
+            "instance": i,
+            "instance_hours_24h": hours
+        })
+    snapshot.history_usage = new_hist
+    log.info(f"Generated synthetic history for snapshot ({len(new_hist)} records)")
+
+# --- Snapshot Manager ---
+
+class SnapshotManager:
+    def __init__(self):
+        self.snapshots: Dict[str, Snapshot] = {}
+        self.active_id: str | None = None
+
+    def add(self, snapshot_id: str, snapshot: Snapshot):
+        _ensure_history(snapshot)
+        self.snapshots[snapshot_id] = snapshot
+        if self.active_id is None:
+            self.active_id = snapshot_id
+
+    def get_active(self) -> Optional[Snapshot]:
+        if self.active_id:
+            return self.snapshots.get(self.active_id)
+        return None
+
+    def set_active(self, snapshot_id: str):
+        if snapshot_id not in self.snapshots:
+            raise ValueError(f"Snapshot {snapshot_id} not found")
+        self.active_id = snapshot_id
+
+    def update_active(self, new_snapshot: Snapshot):
+        if self.active_id:
+            self.snapshots[self.active_id] = new_snapshot
+
+manager = SnapshotManager()
+
+def to_simulation_response(snapshot) -> SimulationResponse:
+    sim = simulate.run_simulation(snapshot)
+    
+    raw_violations = constraints.check_all_placements(snapshot)
+    violations = {}
     for node_vs in raw_violations.values():
         for v in node_vs:
             pid = v.get("pod_id")
@@ -110,9 +159,9 @@ def to_simulation_response(snapshot) -> SimulationResponse:
             if pid and reasons:
                 violations[pid] = reasons
 
-    nodes: List[NodeRowModel] = []
+    nodes_list = []
     for row in sim.nodes_table:
-        nodes.append(
+        nodes_list.append(
             NodeRowModel(
                 node=row.node or "",
                 nodepool=row.nodepool or "",
@@ -141,9 +190,9 @@ def to_simulation_response(snapshot) -> SimulationResponse:
             )
         )
 
-    pods_by_node: Dict[str, List[PodViewModel]] = {}
+    pods_by_node = {}
     for node_name, pods in sim.pods_by_node.items():
-        items: List[PodViewModel] = []
+        items = []
         for p in pods:
             pod_id = f"{p.namespace}/{p.name}"
             items.append(
@@ -158,6 +207,8 @@ def to_simulation_response(snapshot) -> SimulationResponse:
                     is_system=p.is_system,
                     req_cpu_m=p.req_cpu_m,
                     req_mem_b=p.req_mem_b,
+                    usage_cpu_m=p.usage_cpu_m,
+                    usage_mem_b=p.usage_mem_b,
                     active_ratio=p.active_ratio
                 )
             )
@@ -166,70 +217,32 @@ def to_simulation_response(snapshot) -> SimulationResponse:
     return SimulationResponse(
         summary=SimulationSummaryModel(
             total_cost_daily_usd=sim.total_cost_daily_usd,
-            pool_costs_usd=getattr(sim, "pool_costs_usd", {}),
-            projected_pool_costs_usd=sim.projected_pool_costs_usd,
+            
+            # --- FIX: Используем только новые stats ---
+            pool_stats={k: PoolCostModel(cost=v.cost, nodes_count=v.count) for k,v in sim.pool_stats.items()},
+            projected_pool_stats={k: PoolCostModel(cost=v.cost, nodes_count=v.count) for k,v in sim.projected_pool_stats.items()},
+            
             projected_total_cost_usd=sim.projected_total_cost_usd,
             total_cost_gfw_nodes_usd=sim.total_cost_gfw_nodes_usd,
             total_cost_keda_nodes_usd=sim.total_cost_keda_nodes_usd,
         ),
-        nodes=nodes,
+        nodes=nodes_list,
         pods_by_node=pods_by_node,
         violations=violations,
     )
 
-# ---------------------------------------------------------------------------
-# Snapshot Manager
-# ---------------------------------------------------------------------------
-
-class SnapshotManager:
-    def __init__(self):
-        self.snapshots: Dict[str, Snapshot] = {}
-        self.active_id: str | None = None
-
-    def add(self, snapshot_id: str, snapshot: Snapshot):
-        self.snapshots[snapshot_id] = snapshot
-        if self.active_id is None:
-            self.active_id = snapshot_id
-
-    def get_active(self) -> Optional[Snapshot]:
-        if self.active_id:
-            return self.snapshots.get(self.active_id)
-        return None
-
-    def set_active(self, snapshot_id: str):
-        if snapshot_id not in self.snapshots:
-            raise ValueError(f"Snapshot {snapshot_id} not found")
-        self.active_id = snapshot_id
-
-    def update_active(self, new_snapshot: Snapshot):
-        if self.active_id:
-            self.snapshots[self.active_id] = new_snapshot
-
-manager = SnapshotManager()
-
-# ---------------------------------------------------------------------------
-# App
-# ---------------------------------------------------------------------------
-
-app = FastAPI(title="GFW Capacity Simulator")
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-STATIC_DIR = PROJECT_ROOT / "static"
-SNAPSHOTS_DIR = PROJECT_ROOT / "snapshots"
-LEGACY_PATH = Path(__file__).resolve().parents[1] / "snapshot" / "legacy.json"
-
 @app.on_event("startup")
 async def startup_event() -> None:
-    # 1. Baseline
     try:
         if LEGACY_PATH.exists():
             data = json.loads(LEGACY_PATH.read_text("utf-8"))
             baseline = snapshot_from_legacy_data(data)
             manager.add("baseline", baseline)
             manager.set_active("baseline")
-    except Exception: pass
+            log.info("Baseline loaded.")
+    except Exception as e:
+        log.warning(f"Failed to load baseline: {e}")
 
-    # 2. Snapshots
     try:
         if not SNAPSHOTS_DIR.exists():
             SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -249,11 +262,11 @@ async def startup_event() -> None:
         
         if last_loaded_id:
             manager.set_active(last_loaded_id)
-            
+            log.info(f"Activated latest snapshot: {last_loaded_id}")
+        
     except Exception as e:
-        log.error(f"Error loading snapshots: {e}")
+        log.error(f"Error loading snapshots directory: {e}")
 
-    # Refresh prices
     current = manager.get_active()
     if current:
         try:
@@ -266,10 +279,16 @@ async def startup_event() -> None:
 
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    else:
+        log.warning(f"Static dir not found at {STATIC_DIR}")
 
-# ---------------------------------------------------------------------------
-# API Endpoints
-# ---------------------------------------------------------------------------
+# --- Endpoints ---
+
+@app.get("/", include_in_schema=False)
+def index() -> FileResponse:
+    if STATIC_DIR.exists():
+        return FileResponse(STATIC_DIR / "index.html")
+    raise HTTPException(status_code=404, detail="Static files not found")
 
 class SnapshotListItem(BaseModel):
     id: str
@@ -301,16 +320,12 @@ def capture_snapshot():
     try:
         new_snap = collect_k8s_snapshot()
         new_id = f"k8s-{int(time.time())}"
-        
         if not SNAPSHOTS_DIR.exists():
             SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
-            
         file_path = SNAPSHOTS_DIR / f"{new_id}.json"
         save_snapshot_to_file(new_snap, file_path)
-        
         manager.add(new_id, new_snap)
         manager.set_active(new_id)
-        
         return CreateSnapshotResponse(id=new_id, message=f"Captured {new_id}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -330,74 +345,67 @@ def _derive_placement_patches(node: Any, nodepool: Optional[NodePool]) -> tuple[
         if key in seen_keys: return
         tolerations.append({"key": key, "operator": operator, "value": value, "effect": effect})
         seen_keys.add(key)
-
     node_taints = getattr(node, "taints", []) or []
     for t in node_taints:
         k = t.get("key"); v = t.get("value"); eff = t.get("effect")
         op = "Equal" if v else "Exists"
         _add_tol(k, v, op, eff)
-
     if nodepool:
         pool_taints = getattr(nodepool, "taints", []) or []
         for t in pool_taints:
             k = t.get("key"); v = t.get("value"); eff = t.get("effect")
             op = "Equal" if v else "Exists"
             _add_tol(k, v, op, eff)
-            
     node_selector = {}
     pool_name = getattr(node, "nodepool", None)
     if pool_name:
         node_selector["karpenter.sh/nodepool"] = pool_name
-    
     return tolerations, node_selector
 
 @app.post("/plan_move", response_model=PlanMoveResponse)
 def plan_move(req: PlanMoveRequest) -> PlanMoveResponse:
     snap = manager.get_active()
-    if snap is None:
-        raise HTTPException(status_code=500, detail="Snapshot not init")
+    if snap is None: raise HTTPException(status_code=500, detail="Snapshot not init")
     
     pod = snap.pods.get(PodId(req.pod_id))
-    if not pod:
-         raise HTTPException(status_code=404, detail=f"Pod {req.pod_id} not found")
-         
+    if not pod: raise HTTPException(status_code=404, detail=f"Pod {req.pod_id} not found")
     target_node = snap.nodes.get(NodeId(req.target_node))
-    if not target_node:
-        raise HTTPException(status_code=404, detail=f"Target node {req.target_node} not found")
+    if not target_node: raise HTTPException(status_code=404, detail=f"Target node {req.target_node} not found")
 
     target_pool_name = getattr(target_node, "nodepool", None)
     target_pool = snap.nodepools.get(target_pool_name) if target_pool_name else None
     
     suggested_tols, suggested_sel = _derive_placement_patches(target_node, target_pool)
     
+    owner_kind = getattr(pod, "owner_kind", None)
+    owner_name = getattr(pod, "owner_name", None)
+    
+    if owner_kind == "ReplicaSet" and owner_name:
+        parts = owner_name.rsplit("-", 1)
+        if len(parts) > 1:
+             owner_kind = "Deployment"
+             owner_name = parts[0]
+
     return PlanMoveResponse(
         pod_id=req.pod_id,
-        owner_kind=getattr(pod, "owner_kind", None),
-        owner_name=getattr(pod, "owner_name", None),
+        owner_kind=owner_kind,
+        owner_name=owner_name,
         current_req_cpu_m=int(pod.req_cpu_m or 0),
         current_req_mem_b=int(pod.req_mem_b or 0),
         suggested_tolerations=suggested_tols,
         suggested_node_selector=suggested_sel
     )
 
-@app.get("/", include_in_schema=False)
-def index() -> FileResponse:
-    if STATIC_DIR.exists():
-        return FileResponse(STATIC_DIR / "index.html")
-    raise HTTPException(status_code=404)
-
 @app.get("/simulate", response_model=SimulationResponse)
-def simulate() -> SimulationResponse:
+def simulate_endpoint() -> SimulationResponse:
     snap = manager.get_active()
-    if snap is None:
-        raise HTTPException(status_code=500, detail="Snapshot is not initialized")
+    if snap is None: raise HTTPException(status_code=500, detail="Snapshot is not initialized")
     return to_simulation_response(snap)
 
 @app.post("/mutate", response_model=SimulationResponse)
 def mutate(req: MutateRequest | OperationModel) -> SimulationResponse:
     snap = manager.get_active()
-    if snap is None:
-        raise HTTPException(status_code=500, detail="Snapshot is not initialized")
+    if snap is None: raise HTTPException(status_code=500, detail="Snapshot is not initialized")
 
     ops = req.operations if isinstance(req, MutateRequest) else [req]
     
@@ -407,16 +415,70 @@ def mutate(req: MutateRequest | OperationModel) -> SimulationResponse:
                  path = SNAPSHOTS_DIR / f"{manager.active_id}.json"
                  if path.exists():
                      snap = load_snapshot_from_file(path)
+                     _ensure_history(snap)
                      manager.snapshots[manager.active_id] = snap
             elif "baseline" in manager.snapshots:
                 snap = _clone_snapshot(manager.snapshots["baseline"])
                 manager.add("working-copy", snap)
                 manager.set_active("working-copy")
 
+        elif op.op == "move_pod_to_node":
+            target_node_id = NodeId(op.node_name)
+            if target_node_id not in snap.nodes:
+                 raise HTTPException(404, f"Node {target_node_id} not found")
+            pids = [PodId(pid) for pid in op.pod_ids]
+            
+            if op.overrides:
+                snap = patch_pods_in_snapshot(
+                    snap, pids,
+                    req_cpu_m=op.overrides.req_cpu_m,
+                    req_mem_b=op.overrides.req_mem_b,
+                    tolerations=op.overrides.tolerations,
+                    node_selector=op.overrides.node_selector,
+                    affinity=op.overrides.affinity
+                )
+            
+            for pid in pids:
+                if pid in snap.pods:
+                    snap.pods[pid].node = target_node_id
+
+        elif op.op == "move_owner_to_pool":
+            target_pool_name = NodePoolName(op.target_pool)
+            owner_name_prefix = op.owner_name
+            owner_kind = op.owner_kind
+            
+            affected_pids = []
+            
+            for pid, p in snap.pods.items():
+                p_owner_kind = getattr(p, "owner_kind", "")
+                p_owner_name = getattr(p, "owner_name", "")
+                
+                match = False
+                if p_owner_kind == owner_kind and p_owner_name == owner_name_prefix:
+                    match = True
+                elif owner_kind == "Deployment" and p_owner_kind == "ReplicaSet":
+                    if p_owner_name and p_owner_name.startswith(owner_name_prefix):
+                        match = True
+                
+                if match:
+                    if op.overrides:
+                        if op.overrides.req_cpu_m: p.req_cpu_m = op.overrides.req_cpu_m
+                        if op.overrides.req_mem_b: p.req_mem_b = op.overrides.req_mem_b
+                        if op.overrides.tolerations is not None: p.tolerations = op.overrides.tolerations
+                        if op.overrides.node_selector is not None: p.node_selector = op.overrides.node_selector
+                        if op.overrides.affinity is not None: p.affinity = op.overrides.affinity
+                    
+                    if not p.node_selector: p.node_selector = {}
+                    p.node_selector["karpenter.sh/nodepool"] = target_pool_name
+                    
+                    # Reset node to trigger rescheduling
+                    p.node = None
+                    affected_pids.append(pid)
+            
+            log.info(f"Moved owner {owner_kind}/{owner_name_prefix} to pool {target_pool_name}. Pods affected: {len(affected_pids)}")
+
         elif op.op == "move_namespace_to_pool":
             snap = move_namespace_to_pool(snap, op.namespace, NodePoolName(op.target_pool), overrides=op.overrides)
-        elif op.op == "move_owner_to_pool":
-            snap = move_owner_to_pool(snap, op.namespace, op.owner_name, NodePoolName(op.target_pool), overrides=op.overrides)
         elif op.op == "move_node_pods_to_pool":
             snap = move_node_pods_to_pool(snap, op.node_name, NodePoolName(op.target_pool), overrides=op.overrides)
         elif op.op == "move_pods_to_pool":
@@ -431,7 +493,7 @@ def mutate(req: MutateRequest | OperationModel) -> SimulationResponse:
             snap = delete_namespace(snap, op.namespace, op.include_system, op.include_daemonsets)
         elif op.op == "delete_owner":
             snap = delete_owner(snap, op.namespace, op.owner_name, op.include_system, op.include_daemonsets)
-        
+
     snap = _prune_nodes_only_daemonsets(snap)
     manager.update_active(snap)
     return to_simulation_response(snap)
@@ -439,8 +501,7 @@ def mutate(req: MutateRequest | OperationModel) -> SimulationResponse:
 @app.post("/admin/refresh-prices")
 def admin_refresh_prices() -> dict:
     snap = manager.get_active()
-    if snap is None:
-        raise HTTPException(status_code=500, detail="Snapshot is not initialized")
+    if snap is None: raise HTTPException(status_code=500, detail="Snapshot is not initialized")
     instance_types = sorted({_pick_instance_type(n) for n in _iter_nodes(snap) if _pick_instance_type(n)})
     state = sim_costs.refresh_prices_from_aws(instance_types)
     return {"ok": True, "region": state.region, "instance_types": instance_types, "hourly_prices": state.hourly_prices}
