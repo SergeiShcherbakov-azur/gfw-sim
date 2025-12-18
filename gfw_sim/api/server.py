@@ -5,6 +5,7 @@ import json
 import time
 import copy
 import logging
+import os  # <-- Нужно для сортировки по времени
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 
@@ -49,8 +50,6 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 def _iter_nodes(snapshot: Snapshot):
     nodes = getattr(snapshot, "nodes", [])
@@ -130,8 +129,11 @@ def to_simulation_response(snapshot) -> SimulationResponse:
                 alloc_mem_b=row.alloc_mem_b,
                 sum_req_cpu_m=row.sum_req_cpu_m,
                 sum_req_mem_b=row.sum_req_mem_b,
+                
+                # --- FIX: Прокидываем usage в API ---
                 sum_usage_cpu_m=getattr(row, "sum_usage_cpu_m", 0),
                 sum_usage_mem_b=getattr(row, "sum_usage_mem_b", 0),
+                
                 ram_util_pct=row.ram_util_pct,
                 ram_ds_gib=row.ram_ds_gib,
                 ram_gfw_gib=row.ram_gfw_gib,
@@ -153,6 +155,7 @@ def to_simulation_response(snapshot) -> SimulationResponse:
     for node_name, pods in sim.pods_by_node.items():
         items: List[PodViewModel] = []
         for p in pods:
+            # PodId во внутренней структуре PodView уже может быть строкой
             pod_id = f"{p.namespace}/{p.name}"
             items.append(
                 PodViewModel(
@@ -166,9 +169,6 @@ def to_simulation_response(snapshot) -> SimulationResponse:
                     is_system=p.is_system,
                     req_cpu_m=p.req_cpu_m,
                     req_mem_b=p.req_mem_b,
-                    
-                    # --- NEW: Прокидываем ratio для UI ---
-                    active_ratio=getattr(p, "active_ratio", 1.0)
                 )
             )
         pods_by_node[node_name] = items
@@ -178,11 +178,9 @@ def to_simulation_response(snapshot) -> SimulationResponse:
             total_cost_daily_usd=sim.total_cost_daily_usd,
             total_cost_gfw_nodes_usd=sim.total_cost_gfw_nodes_usd,
             total_cost_keda_nodes_usd=sim.total_cost_keda_nodes_usd,
-            pool_costs_usd=getattr(sim, "pool_costs_usd", {}),
             
-            # --- NEW: Поля прогноза ---
-            projected_pool_costs_usd=getattr(sim, "projected_pool_costs_usd", {}),
-            projected_total_cost_usd=getattr(sim, "projected_total_cost_usd", 0.0)
+            # --- FIX: Прокидываем pool_costs ---
+            pool_costs_usd=getattr(sim, "pool_costs_usd", {})
         ),
         nodes=nodes,
         pods_by_node=pods_by_node,
@@ -200,6 +198,8 @@ class SnapshotManager:
 
     def add(self, snapshot_id: str, snapshot: Snapshot):
         self.snapshots[snapshot_id] = snapshot
+        # Логика "первого" больше не нужна здесь, 
+        # активный снапшот будем выставлять явно при загрузке.
         if self.active_id is None:
             self.active_id = snapshot_id
 
@@ -225,26 +225,31 @@ manager = SnapshotManager()
 
 app = FastAPI(title="GFW Capacity Simulator")
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 STATIC_DIR = PROJECT_ROOT / "static"
 SNAPSHOTS_DIR = PROJECT_ROOT / "snapshots"
 LEGACY_PATH = Path(__file__).resolve().parents[1] / "snapshot" / "legacy.json"
 
 @app.on_event("startup")
 async def startup_event() -> None:
+    # 1. Загрузка Legacy Baseline (если есть)
     try:
         if LEGACY_PATH.exists():
             data = json.loads(LEGACY_PATH.read_text("utf-8"))
             baseline = snapshot_from_legacy_data(data)
             manager.add("baseline", baseline)
+            # Временно ставим активным, но позже перепишем, если найдем файлы
             manager.set_active("baseline")
             log.info("Baseline loaded.")
     except Exception as e:
         log.warning(f"Failed to load baseline: {e}")
 
+    # 2. Загрузка снапшотов из папки + выбор последнего
     try:
         if not SNAPSHOTS_DIR.exists():
             SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
         
+        # Получаем список файлов и сортируем по времени изменения (от старых к новым)
         snap_files = list(SNAPSHOTS_DIR.glob("*.json"))
         snap_files.sort(key=lambda p: p.stat().st_mtime)
         
@@ -263,6 +268,7 @@ async def startup_event() -> None:
         
         log.info(f"Loaded {count} snapshots from disk.")
         
+        # 3. Активируем самый свежий (последний в списке)
         if last_loaded_id:
             manager.set_active(last_loaded_id)
             log.info(f"Activated latest snapshot: {last_loaded_id}")
@@ -270,6 +276,7 @@ async def startup_event() -> None:
     except Exception as e:
         log.error(f"Error loading snapshots directory: {e}")
 
+    # Обновление цен для активного снапшота
     current = manager.get_active()
     if current:
         try:
@@ -301,6 +308,7 @@ class CreateSnapshotResponse(BaseModel):
 def list_snapshots():
     result = []
     active = manager.active_id
+    # Сортируем ключи, чтобы список был стабильным (можно по времени, но по имени тоже ок)
     keys = sorted(manager.snapshots.keys())
     
     for sid in keys:
@@ -326,7 +334,7 @@ def capture_snapshot():
         save_snapshot_to_file(new_snap, file_path)
         
         manager.add(new_id, new_snap)
-        manager.set_active(new_id)
+        manager.set_active(new_id) # Сразу активируем новый
         
         try:
             itypes = sorted({
@@ -450,7 +458,15 @@ def mutate(req: MutateRequest | OperationModel) -> SimulationResponse:
     
     for op in ops:
         if op.op == "reset_to_baseline":
+            # Сбрасываем к последнему загруженному (baseline может быть не актуален)
+            # Логичнее сбрасывать к "активному на момент старта" или перечитывать файл
+            # В текущей логике "baseline" - это legacy файл.
+            # Если мы хотим reset к текущему снапшоту, нужно хранить его копию.
+            # Пока оставим как есть или можно сделать reload активного ID.
             if manager.active_id and manager.active_id in manager.snapshots:
+                 # ПРОСТОЙ RESET: Перезагружаем текущий активный снапшот из памяти (или файла)
+                 # Но так как мы мутируем объект в памяти, нам нужна исходная копия.
+                 # Для упрощения: просто перезагрузим файл с диска для активного ID
                  if manager.active_id.startswith("k8s-"):
                      path = SNAPSHOTS_DIR / f"{manager.active_id}.json"
                      if path.exists():

@@ -10,14 +10,16 @@ from .from_legacy import snapshot_from_legacy_data
 
 def snapshot_to_dict(snap: Snapshot) -> Dict[str, Any]:
     nodes_dict = {}
-    nodes = getattr(snap, "nodes", {})
-    for n in nodes.values():
+    for n in getattr(snap, "nodes", {}).values():
         nodes_dict[n.name] = {
             "name": n.name,
             "nodepool": n.nodepool,
             "instance_type": n.instance_type,
             "alloc_cpu_m": int(n.alloc_cpu_m),
             "alloc_mem_b": int(n.alloc_mem_b),
+            # NEW
+            "alloc_pods": int(n.alloc_pods),
+            
             "capacity_type": n.capacity_type,
             "labels": n.labels,
             "taints": n.taints,
@@ -26,8 +28,7 @@ def snapshot_to_dict(snap: Snapshot) -> Dict[str, Any]:
         }
 
     pods_dict = {}
-    pods = getattr(snap, "pods", {})
-    for p in pods.values():
+    for p in getattr(snap, "pods", {}).values():
         pods_dict[p.id] = {
             "name": p.name,
             "namespace": p.namespace,
@@ -43,19 +44,34 @@ def snapshot_to_dict(snap: Snapshot) -> Dict[str, Any]:
             "is_gfw": p.is_gfw,
             "tolerations": p.tolerations,
             "node_selector": p.node_selector,
-            "affinity": p.affinity
+            
+            # NEW
+            "affinity": p.affinity,
+            "topology_spread_constraints": p.topology_spread_constraints,
+            
+            # Persist Ratio
+            "active_ratio": getattr(p, "active_ratio", 1.0)
+        }
+    
+    nodepools_dict = {}
+    for np in getattr(snap, "nodepools", {}).values():
+        nodepools_dict[np.name] = {
+            "name": np.name,
+            "labels": np.labels,
+            "taints": np.taints,
+            "is_keda": np.is_keda,
+            "consolidation_policy": np.consolidation_policy
         }
 
     prices_map = {}
-    prices = getattr(snap, "prices", {})
-    for k, v in prices.items():
+    for k, v in getattr(snap, "prices", {}).items():
         prices_map[str(k)] = float(v.usd_per_hour)
 
     return {
         "baseline": {"nodes": nodes_dict, "pods": pods_dict},
+        "nodepools": nodepools_dict,
         "prices_by_instance": prices_map,
         "keda_pool": getattr(snap, "keda_pool_name", None),
-        # SAVE HISTORY
         "history_usage": getattr(snap, "history_usage", [])
     }
 

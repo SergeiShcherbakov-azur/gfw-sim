@@ -5,16 +5,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
 from ..types import (
-    NodeId,
-    PodId,
-    NodePoolName,
-    InstanceType,
-    Namespace,
-    CpuMillis,
-    Bytes,
-    UsdPerHour,
+    NodeId, PodId, NodePoolName, InstanceType, Namespace, CpuMillis, Bytes, UsdPerHour
 )
-
 
 @dataclass
 class NodePool:
@@ -23,7 +15,8 @@ class NodePool:
     taints: List[Dict[str, str]] = field(default_factory=list)
     is_keda: bool = False
     schedule_name: str = "default"
-
+    # "WhenUnderutilized" (Consolidation ON) or "WhenEmpty" (Consolidation OFF)
+    consolidation_policy: str = "WhenUnderutilized"
 
 @dataclass
 class Node:
@@ -33,12 +26,14 @@ class Node:
     instance_type: InstanceType
     alloc_cpu_m: CpuMillis
     alloc_mem_b: Bytes
+    # Лимит подов на ноду (из status.allocatable)
+    alloc_pods: int = 110 
+    
     capacity_type: str = "on_demand"
     labels: Dict[str, str] = field(default_factory=dict)
     taints: List[Dict[str, str]] = field(default_factory=list)
     is_virtual: bool = False
     uptime_hours_24h: float = 24.0
-
 
 @dataclass
 class Pod:
@@ -59,14 +54,13 @@ class Pod:
     tolerations: List[Dict[str, Any]] = field(default_factory=list)
     node_selector: Dict[str, str] = field(default_factory=dict)
     affinity: Dict[str, Any] = field(default_factory=dict)
+    topology_spread_constraints: List[Dict[str, Any]] = field(default_factory=list)
 
     usage_cpu_m: Optional[CpuMillis] = None
     usage_mem_b: Optional[Bytes] = None
     
-    # --- NEW: Коэффициент активности (0.0 - 1.0) ---
-    # 1.0 = работает 24/7, 0.5 = работает 12ч в сутки
+    # Коэффициент активности (0.0 - 1.0) на основе метрик
     active_ratio: float = 1.0
-
 
 @dataclass
 class InstancePrice:
@@ -74,7 +68,6 @@ class InstancePrice:
     usd_per_hour: UsdPerHour
     purchasing: str = "on_demand"
     source: str = "unknown"
-
 
 @dataclass
 class Schedule:
@@ -85,7 +78,6 @@ class Schedule:
     @property
     def effective_hours_per_day(self) -> float:
         return self.hours_per_day * (self.days_per_week / 7.0)
-
 
 @dataclass
 class Snapshot:

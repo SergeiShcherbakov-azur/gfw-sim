@@ -43,6 +43,12 @@ def parse_memory(quantity: str | None) -> Bytes:
     try: return Bytes(int(quantity))
     except ValueError: return Bytes(0)
 
+def parse_quantity_int(q: str | None) -> int:
+    if not q: return 0
+    if q.endswith('m'): return int(float(q[:-1]))
+    try: return int(q)
+    except: return 0
+
 def _run_kubectl(args: List[str], context: str | None) -> Dict[str, Any]:
     cmd = ["kubectl"] + args + ["-o", "json"]
     if context: cmd.extend(["--context", context])
@@ -114,7 +120,7 @@ def _collect_aws_metadata(region="eu-central-1", profile: Optional[str] = None) 
         ]
         if profile:
             cmd.extend(["--profile", profile])
-        
+            
         res = subprocess.check_output(cmd, stderr=subprocess.PIPE)
         data = json.loads(res)
         result = {}
@@ -129,8 +135,14 @@ def _collect_aws_metadata(region="eu-central-1", profile: Optional[str] = None) 
                     lt = datetime.fromisoformat(launch_time_str.replace("Z", "+00:00"))
                     delta = now - lt
                     uptime_hours = min(24.0, delta.total_seconds() / 3600.0)
-                except Exception: pass
-            result[name] = {"capacity_type": item.get("Lifecycle") or "on_demand", "uptime_hours": uptime_hours}
+                except Exception:
+                    pass
+
+            result[name] = {
+                "capacity_type": item.get("Lifecycle") or "on_demand",
+                "uptime_hours": uptime_hours
+            }
+            
         return result
     except Exception as e:
         log.error(f"Failed to collect AWS metadata: {e}")
@@ -138,55 +150,53 @@ def _collect_aws_metadata(region="eu-central-1", profile: Optional[str] = None) 
 
 def _collect_workload_activity() -> Dict[Tuple[str, str, str], float]:
     """
-    Собирает коэффициент активности (0..1) для Workloads за 7 дней.
-    Использует метрики контроллеров (Deployments, StatefulSets), что надежнее.
+    Собирает коэффициент активности (0..1) для Workloads (Deployment, StatefulSet) за 7 дней.
     """
     ts = _get_query_timestamp()
     result = {}
 
-    # 1. DEPLOYMENTS
-    q_dep = """
+    q_deploy = """
     avg_over_time(
       (sum by (namespace, deployment) (kube_deployment_status_replicas{cluster="shared-dev"}) > bool 0)[7d:10m]
     )
     """
     
-    # 2. STATEFULSETS
     q_sts = """
     avg_over_time(
       (sum by (namespace, statefulset) (kube_statefulset_status_replicas{cluster="shared-dev"}) > bool 0)[7d:10m]
     )
     """
 
-    def fetch(query, label_key, kind_name):
+    def fetch(query, kind_label, kind_name):
         try:
             clean_q = re.sub(r'\s+', ' ', query).strip()
-            resp = requests.get(VM_URL, params={"query": clean_q, "time": ts}, timeout=60)
+            resp = requests.get(VM_URL, params={"query": clean_q, "time": ts}, timeout=90)
             if not resp.ok: 
                 log.warning(f"Activity query failed for {kind_name}: {resp.status_code}")
                 return
             
             data = resp.json().get("data", {}).get("result", [])
+            count = 0
             for r in data:
                 m = r.get("metric", {})
                 ns = m.get("namespace")
-                name = m.get(label_key)
+                name = m.get(kind_label) or m.get("name") or m.get(f"{kind_label}_name") or m.get("workload")
                 val = r.get("value", [0, "0"])[1]
                 
                 if ns and name:
                     try:
-                        result[(ns, name, kind_name)] = float(val)
+                        ratio = float(val)
+                        result[(ns, name, kind_name)] = ratio
+                        count += 1
                     except ValueError: pass
+            
+            log.info(f"Loaded {count} activity records for {kind_name}")
         except Exception as e:
             log.warning(f"Error collecting {kind_name} activity: {e}")
 
-    log.info("Collecting workload activity (Deployments)...")
-    fetch(q_dep, "deployment", "Deployment")
-    
-    log.info("Collecting workload activity (StatefulSets)...")
+    log.info("Collecting workload activity...")
+    fetch(q_deploy, "deployment", "Deployment")
     fetch(q_sts, "statefulset", "StatefulSet")
-    
-    log.info(f"Collected activity stats for {len(result)} workloads.")
     return result
 
 def _collect_historical_usage() -> List[Dict[str, Any]]:
@@ -197,9 +207,7 @@ def _collect_historical_usage() -> List[Dict[str, Any]]:
     
     node_usage_map = {}
     node_meta_map = {}
-    
     try:
-        log.info(f"Querying history usage...")
         resp = requests.get(VM_URL, params={"query": q_usage, "time": ts}, timeout=60)
         if resp.ok:
             for r in resp.json().get("data", {}).get("result", []):
@@ -215,7 +223,7 @@ def _collect_historical_usage() -> List[Dict[str, Any]]:
                         "pool": m["label_karpenter_sh_nodepool"], 
                         "instance": m.get("label_node_kubernetes_io_instance_type", "unknown")
                     }
-
+        
         aggregated = {}
         for node, hours in node_usage_map.items():
             meta = node_meta_map.get(node)
@@ -230,10 +238,8 @@ def _collect_historical_usage() -> List[Dict[str, Any]]:
         
         for (pool, inst), hours in aggregated.items():
             history.append({"pool": pool, "instance": inst, "instance_hours_24h": hours})
-            
     except Exception as e:
         log.warning(f"History collection failed: {e}")
-        
     return history
 
 def _collect_via_kubectl(context: str | None, aws_profile: str | None) -> Snapshot:
@@ -254,11 +260,29 @@ def _collect_via_kubectl(context: str | None, aws_profile: str | None) -> Snapsh
             meta = item.get("metadata", {})
             spec = item.get("spec", {})
             name = NodePoolName(meta.get("name"))
+            
+            # Parsing Taints & Labels
+            labels = spec.get("template", {}).get("metadata", {}).get("labels", {})
             taints = [{"key": t.get("key"), "value": t.get("value"), "effect": t.get("effect")} for t in spec.get("template", {}).get("spec", {}).get("taints", [])]
+            
+            # Parsing Consolidation Policy
+            disruption = spec.get("disruption", {})
+            consolidation_policy = disruption.get("consolidationPolicy", "WhenUnderutilized")
+            if "consolidationPolicy" not in disruption and disruption.get("consolidation", {}).get("enabled") is False:
+                 consolidation_policy = "WhenEmpty"
+
             is_keda = "keda" in str(name).lower()
             if is_keda and not any(t["key"] == "keda_nightly" for t in taints):
                 taints.append({"key": "keda_nightly", "value": "true", "effect": "NoSchedule"})
-            nodepools[name] = NodePool(name=name, labels={}, taints=taints, is_keda=is_keda, schedule_name="keda-weekdays-12h" if is_keda else "default")
+            
+            nodepools[name] = NodePool(
+                name=name, 
+                labels=labels, 
+                taints=taints, 
+                is_keda=is_keda, 
+                schedule_name="keda-weekdays-12h" if is_keda else "default",
+                consolidation_policy=consolidation_policy
+            )
     except: pass
 
     nodes = {}
@@ -268,18 +292,27 @@ def _collect_via_kubectl(context: str | None, aws_profile: str | None) -> Snapsh
         spec = kn.get("spec", {})
         name = meta.get("name")
         labels = meta.get("labels", {})
-        pool = NodePoolName(labels.get("karpenter.sh/nodepool") or labels.get("node.kubernetes.io/instance-group") or "default")
+        pool_name = NodePoolName(labels.get("karpenter.sh/nodepool") or labels.get("node.kubernetes.io/instance-group") or "default")
         inst = InstanceType(labels.get("node.kubernetes.io/instance-type") or "unknown")
         
-        if pool not in nodepools:
-             is_keda = "keda" in str(pool).lower()
-             nodepools[pool] = NodePool(name=pool, is_keda=is_keda, schedule_name="keda-weekdays-12h" if is_keda else "default")
+        if pool_name not in nodepools:
+             is_keda = "keda" in str(pool_name).lower()
+             nodepools[pool_name] = NodePool(
+                 name=pool_name, 
+                 is_keda=is_keda, 
+                 schedule_name="keda-weekdays-12h" if is_keda else "default",
+                 consolidation_policy="WhenUnderutilized"
+            )
         
         am = aws_meta.get(name, {})
+        alloc = status.get("allocatable", {})
+        
         nodes[NodeId(name)] = Node(
-            id=NodeId(name), name=name, nodepool=pool, instance_type=inst,
-            alloc_cpu_m=parse_cpu(status.get("allocatable", {}).get("cpu")),
-            alloc_mem_b=parse_memory(status.get("allocatable", {}).get("memory")),
+            id=NodeId(name), name=name, nodepool=pool_name, instance_type=inst,
+            alloc_cpu_m=parse_cpu(alloc.get("cpu")),
+            alloc_mem_b=parse_memory(alloc.get("memory")),
+            # Считываем реальный лимит подов
+            alloc_pods=parse_quantity_int(alloc.get("pods")),
             capacity_type=am.get("capacity_type", "on_demand"),
             labels=labels,
             taints=[{"key": t.get("key"), "value": t.get("value"), "effect": t.get("effect")} for t in spec.get("taints", [])],
@@ -291,29 +324,38 @@ def _collect_via_kubectl(context: str | None, aws_profile: str | None) -> Snapsh
         meta = kp.get("metadata", {})
         spec = kp.get("spec", {})
         pod_id = PodId(f"{meta.get('namespace')}/{meta.get('name')}")
-        
-        owner_kind = meta["ownerReferences"][0].get("kind") if meta.get("ownerReferences") else None
-        owner_name = meta["ownerReferences"][0].get("name") if meta.get("ownerReferences") else None
-        
+        node_name = spec.get("nodeName")
+        owner_ref = meta.get("ownerReferences", [{}])[0]
+        owner_kind, owner_name = owner_ref.get("kind"), owner_ref.get("name")
+
         req_cpu = sum(int(parse_cpu(c.get("resources",{}).get("requests",{}).get("cpu"))) for c in spec.get("containers",[]))
         req_mem = sum(int(parse_memory(c.get("resources",{}).get("requests",{}).get("memory"))) for c in spec.get("containers",[]))
         usage = metrics_map.get(str(pod_id), {})
         
-        # --- MATCH WORKLOAD ACTIVITY ---
+        # Match Activity
         active_ratio = 1.0
+        found_match = False
         if owner_kind and owner_name:
-            # 1. Direct Match
             key = (meta.get("namespace"), owner_name, owner_kind)
             if key in activity_map:
                 active_ratio = activity_map[key]
-            # 2. ReplicaSet -> Deployment heuristic (e.g. "myapp-7d8f9c" -> "myapp")
-            elif owner_kind == "ReplicaSet" and owner_name.rfind("-") > 0:
-                # Берем часть до последнего дефиса
-                dep_name = owner_name.rsplit("-", 1)[0]
-                key_dep = (meta.get("namespace"), dep_name, "Deployment")
-                if key_dep in activity_map:
-                    active_ratio = activity_map[key_dep]
-        
+                found_match = True
+            elif owner_kind == "ReplicaSet":
+                if owner_name.rfind("-") > 0:
+                    dep_name = owner_name.rsplit("-", 1)[0]
+                    key_dep = (meta.get("namespace"), dep_name, "Deployment")
+                    if key_dep in activity_map:
+                        active_ratio = activity_map[key_dep]
+                        found_match = True
+                
+                if not found_match:
+                    ns = meta.get("namespace")
+                    for (an_ns, an_name, an_kind), ratio in activity_map.items():
+                        if an_kind == "Deployment" and an_ns == ns and owner_name.startswith(an_name):
+                            active_ratio = ratio
+                            found_match = True
+                            break
+
         pods[pod_id] = Pod(
             id=pod_id, name=meta.get("name"), namespace=Namespace(meta.get("namespace")),
             node=NodeId(spec.get("nodeName")) if spec.get("nodeName") in nodes else None,
@@ -322,6 +364,11 @@ def _collect_via_kubectl(context: str | None, aws_profile: str | None) -> Snapsh
             is_daemonset=(owner_kind=="DaemonSet"), is_system=(meta.get("namespace") in ["kube-system","monitoring"]), is_gfw=(owner_kind!="DaemonSet"),
             tolerations=[{"key":t.get("key"),"operator":t.get("operator"),"value":t.get("value"),"effect":t.get("effect")} for t in spec.get("tolerations",[])],
             node_selector=spec.get("nodeSelector") or {},
+            
+            # Collect affinity/topology for correct simulation
+            affinity=spec.get("affinity") or {},
+            topology_spread_constraints=spec.get("topologySpreadConstraints") or [],
+            
             usage_cpu_m=CpuMillis(int(usage.get("cpu_m", 0))) if "cpu_m" in usage else None,
             usage_mem_b=Bytes(int(usage.get("mem_b", 0))) if "mem_b" in usage else None,
             active_ratio=active_ratio
