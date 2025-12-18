@@ -15,7 +15,6 @@ class NodePool:
     taints: List[Dict[str, str]] = field(default_factory=list)
     is_keda: bool = False
     schedule_name: str = "default"
-    # "WhenUnderutilized" (Consolidation ON) or "WhenEmpty" (Consolidation OFF)
     consolidation_policy: str = "WhenUnderutilized"
 
 @dataclass
@@ -26,7 +25,7 @@ class Node:
     instance_type: InstanceType
     alloc_cpu_m: CpuMillis
     alloc_mem_b: Bytes
-    # Лимит подов на ноду (из status.allocatable)
+    # --- NEW: Лимит подов (Max Pods) ---
     alloc_pods: int = 110 
     
     capacity_type: str = "on_demand"
@@ -54,12 +53,9 @@ class Pod:
     tolerations: List[Dict[str, Any]] = field(default_factory=list)
     node_selector: Dict[str, str] = field(default_factory=dict)
     affinity: Dict[str, Any] = field(default_factory=dict)
-    topology_spread_constraints: List[Dict[str, Any]] = field(default_factory=list)
 
     usage_cpu_m: Optional[CpuMillis] = None
     usage_mem_b: Optional[Bytes] = None
-    
-    # Коэффициент активности (0.0 - 1.0) на основе метрик
     active_ratio: float = 1.0
 
 @dataclass

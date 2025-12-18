@@ -17,7 +17,7 @@ def snapshot_to_dict(snap: Snapshot) -> Dict[str, Any]:
             "instance_type": n.instance_type,
             "alloc_cpu_m": int(n.alloc_cpu_m),
             "alloc_mem_b": int(n.alloc_mem_b),
-            # NEW
+            # --- NEW ---
             "alloc_pods": int(n.alloc_pods),
             
             "capacity_type": n.capacity_type,
@@ -44,12 +44,7 @@ def snapshot_to_dict(snap: Snapshot) -> Dict[str, Any]:
             "is_gfw": p.is_gfw,
             "tolerations": p.tolerations,
             "node_selector": p.node_selector,
-            
-            # NEW
             "affinity": p.affinity,
-            "topology_spread_constraints": p.topology_spread_constraints,
-            
-            # Persist Ratio
             "active_ratio": getattr(p, "active_ratio", 1.0)
         }
     

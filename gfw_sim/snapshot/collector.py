@@ -149,23 +149,10 @@ def _collect_aws_metadata(region="eu-central-1", profile: Optional[str] = None) 
         return {}
 
 def _collect_workload_activity() -> Dict[Tuple[str, str, str], float]:
-    """
-    Собирает коэффициент активности (0..1) для Workloads (Deployment, StatefulSet) за 7 дней.
-    """
     ts = _get_query_timestamp()
     result = {}
-
-    q_deploy = """
-    avg_over_time(
-      (sum by (namespace, deployment) (kube_deployment_status_replicas{cluster="shared-dev"}) > bool 0)[7d:10m]
-    )
-    """
-    
-    q_sts = """
-    avg_over_time(
-      (sum by (namespace, statefulset) (kube_statefulset_status_replicas{cluster="shared-dev"}) > bool 0)[7d:10m]
-    )
-    """
+    q_deploy = 'avg_over_time((sum by (namespace, deployment) (kube_deployment_status_replicas{cluster="shared-dev"}) > bool 0)[7d:10m])'
+    q_sts = 'avg_over_time((sum by (namespace, statefulset) (kube_statefulset_status_replicas{cluster="shared-dev"}) > bool 0)[7d:10m])'
 
     def fetch(query, kind_label, kind_name):
         try:
@@ -174,7 +161,6 @@ def _collect_workload_activity() -> Dict[Tuple[str, str, str], float]:
             if not resp.ok: 
                 log.warning(f"Activity query failed for {kind_name}: {resp.status_code}")
                 return
-            
             data = resp.json().get("data", {}).get("result", [])
             count = 0
             for r in data:
@@ -182,14 +168,12 @@ def _collect_workload_activity() -> Dict[Tuple[str, str, str], float]:
                 ns = m.get("namespace")
                 name = m.get(kind_label) or m.get("name") or m.get(f"{kind_label}_name") or m.get("workload")
                 val = r.get("value", [0, "0"])[1]
-                
                 if ns and name:
                     try:
                         ratio = float(val)
                         result[(ns, name, kind_name)] = ratio
                         count += 1
                     except ValueError: pass
-            
             log.info(f"Loaded {count} activity records for {kind_name}")
         except Exception as e:
             log.warning(f"Error collecting {kind_name} activity: {e}")
@@ -204,7 +188,6 @@ def _collect_historical_usage() -> List[Dict[str, Any]]:
     ts = _get_query_timestamp()
     q_usage = 'sum(sum_over_time((max by (node) (up{job="kubelet", cluster="shared-dev"} == 1))[1d:1m])) by (node) / 60'
     q_meta = 'last_over_time(kube_node_labels{cluster="shared-dev", label_karpenter_sh_nodepool!=""}[1d])'
-    
     node_usage_map = {}
     node_meta_map = {}
     try:
@@ -213,7 +196,6 @@ def _collect_historical_usage() -> List[Dict[str, Any]]:
             for r in resp.json().get("data", {}).get("result", []):
                 try: node_usage_map[r["metric"]["node"]] = float(r["value"][1])
                 except: pass
-        
         resp = requests.get(VM_URL, params={"query": q_meta, "time": ts}, timeout=60)
         if resp.ok:
             for r in resp.json().get("data", {}).get("result", []):
@@ -223,7 +205,6 @@ def _collect_historical_usage() -> List[Dict[str, Any]]:
                         "pool": m["label_karpenter_sh_nodepool"], 
                         "instance": m.get("label_node_kubernetes_io_instance_type", "unknown")
                     }
-        
         aggregated = {}
         for node, hours in node_usage_map.items():
             meta = node_meta_map.get(node)
@@ -231,11 +212,9 @@ def _collect_historical_usage() -> List[Dict[str, Any]]:
                 short = node.split('.')[0]
                 for k, v in node_meta_map.items():
                     if k.startswith(short): meta = v; break
-            
             if meta:
                 key = (meta["pool"], meta["instance"])
                 aggregated[key] = aggregated.get(key, 0.0) + hours
-        
         for (pool, inst), hours in aggregated.items():
             history.append({"pool": pool, "instance": inst, "instance_hours_24h": hours})
     except Exception as e:
@@ -260,12 +239,8 @@ def _collect_via_kubectl(context: str | None, aws_profile: str | None) -> Snapsh
             meta = item.get("metadata", {})
             spec = item.get("spec", {})
             name = NodePoolName(meta.get("name"))
-            
-            # Parsing Taints & Labels
             labels = spec.get("template", {}).get("metadata", {}).get("labels", {})
             taints = [{"key": t.get("key"), "value": t.get("value"), "effect": t.get("effect")} for t in spec.get("template", {}).get("spec", {}).get("taints", [])]
-            
-            # Parsing Consolidation Policy
             disruption = spec.get("disruption", {})
             consolidation_policy = disruption.get("consolidationPolicy", "WhenUnderutilized")
             if "consolidationPolicy" not in disruption and disruption.get("consolidation", {}).get("enabled") is False:
@@ -276,10 +251,7 @@ def _collect_via_kubectl(context: str | None, aws_profile: str | None) -> Snapsh
                 taints.append({"key": "keda_nightly", "value": "true", "effect": "NoSchedule"})
             
             nodepools[name] = NodePool(
-                name=name, 
-                labels=labels, 
-                taints=taints, 
-                is_keda=is_keda, 
+                name=name, labels=labels, taints=taints, is_keda=is_keda, 
                 schedule_name="keda-weekdays-12h" if is_keda else "default",
                 consolidation_policy=consolidation_policy
             )
@@ -311,8 +283,10 @@ def _collect_via_kubectl(context: str | None, aws_profile: str | None) -> Snapsh
             id=NodeId(name), name=name, nodepool=pool_name, instance_type=inst,
             alloc_cpu_m=parse_cpu(alloc.get("cpu")),
             alloc_mem_b=parse_memory(alloc.get("memory")),
-            # Считываем реальный лимит подов
+            
+            # --- NEW: Считываем кол-во подов ---
             alloc_pods=parse_quantity_int(alloc.get("pods")),
+            
             capacity_type=am.get("capacity_type", "on_demand"),
             labels=labels,
             taints=[{"key": t.get("key"), "value": t.get("value"), "effect": t.get("effect")} for t in spec.get("taints", [])],
@@ -332,7 +306,6 @@ def _collect_via_kubectl(context: str | None, aws_profile: str | None) -> Snapsh
         req_mem = sum(int(parse_memory(c.get("resources",{}).get("requests",{}).get("memory"))) for c in spec.get("containers",[]))
         usage = metrics_map.get(str(pod_id), {})
         
-        # Match Activity
         active_ratio = 1.0
         found_match = False
         if owner_kind and owner_name:
@@ -347,28 +320,20 @@ def _collect_via_kubectl(context: str | None, aws_profile: str | None) -> Snapsh
                     if key_dep in activity_map:
                         active_ratio = activity_map[key_dep]
                         found_match = True
-                
                 if not found_match:
                     ns = meta.get("namespace")
                     for (an_ns, an_name, an_kind), ratio in activity_map.items():
                         if an_kind == "Deployment" and an_ns == ns and owner_name.startswith(an_name):
-                            active_ratio = ratio
-                            found_match = True
-                            break
+                            active_ratio = ratio; break
 
         pods[pod_id] = Pod(
             id=pod_id, name=meta.get("name"), namespace=Namespace(meta.get("namespace")),
-            node=NodeId(spec.get("nodeName")) if spec.get("nodeName") in nodes else None,
+            node=NodeId(node_name) if node_name in nodes else None,
             owner_kind=owner_kind, owner_name=owner_name,
             req_cpu_m=CpuMillis(req_cpu), req_mem_b=Bytes(req_mem),
             is_daemonset=(owner_kind=="DaemonSet"), is_system=(meta.get("namespace") in ["kube-system","monitoring"]), is_gfw=(owner_kind!="DaemonSet"),
             tolerations=[{"key":t.get("key"),"operator":t.get("operator"),"value":t.get("value"),"effect":t.get("effect")} for t in spec.get("tolerations",[])],
             node_selector=spec.get("nodeSelector") or {},
-            
-            # Collect affinity/topology for correct simulation
-            affinity=spec.get("affinity") or {},
-            topology_spread_constraints=spec.get("topologySpreadConstraints") or [],
-            
             usage_cpu_m=CpuMillis(int(usage.get("cpu_m", 0))) if "cpu_m" in usage else None,
             usage_mem_b=Bytes(int(usage.get("mem_b", 0))) if "mem_b" in usage else None,
             active_ratio=active_ratio

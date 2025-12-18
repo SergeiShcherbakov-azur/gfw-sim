@@ -45,8 +45,7 @@ def snapshot_from_legacy_data(data: Dict[str, Any]) -> Snapshot:
             instance_type=InstanceType(v.get("instance_type", "unknown")),
             alloc_cpu_m=CpuMillis(v.get("alloc_cpu_m", 0)),
             alloc_mem_b=Bytes(v.get("alloc_mem_b", 0)),
-            
-            # NEW
+            # --- NEW ---
             alloc_pods=int(v.get("alloc_pods", 110)),
             
             capacity_type=v.get("capacity_type", "on_demand"),
@@ -75,11 +74,7 @@ def snapshot_from_legacy_data(data: Dict[str, Any]) -> Snapshot:
             is_gfw=v.get("is_gfw", True),
             tolerations=v.get("tolerations", []),
             node_selector=v.get("node_selector", {}),
-            
-            # NEW
             affinity=v.get("affinity", {}),
-            topology_spread_constraints=v.get("topology_spread_constraints", []),
-            
             active_ratio=v.get("active_ratio", 1.0)
         )
 

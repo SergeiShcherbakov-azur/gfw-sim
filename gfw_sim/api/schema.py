@@ -1,16 +1,7 @@
 # gfw_sim/api/schema.py
 from __future__ import annotations
-
-from typing import Dict, List, Optional, Any
+from typing import List, Dict, Optional, Any
 from pydantic import BaseModel
-
-class SimulationSummaryModel(BaseModel):
-    total_cost_daily_usd: float
-    total_cost_gfw_nodes_usd: float
-    total_cost_keda_nodes_usd: float
-    pool_costs_usd: Dict[str, float] = {}
-    projected_pool_costs_usd: Dict[str, float] = {}
-    projected_total_cost_usd: float = 0.0
 
 class NodePartsModel(BaseModel):
     gfw_cpu_m: int
@@ -29,8 +20,8 @@ class NodeRowModel(BaseModel):
     alloc_mem_b: int
     sum_req_cpu_m: int
     sum_req_mem_b: int
-    sum_usage_cpu_m: int = 0
-    sum_usage_mem_b: int = 0
+    sum_usage_cpu_m: int
+    sum_usage_mem_b: int
     ram_util_pct: float
     ram_ds_gib: float
     ram_gfw_gib: float
@@ -50,8 +41,15 @@ class PodViewModel(BaseModel):
     is_system: bool
     req_cpu_m: int
     req_mem_b: int
-    # --- NEW ---
-    active_ratio: float = 1.0
+    active_ratio: float
+
+class SimulationSummaryModel(BaseModel):
+    total_cost_daily_usd: float
+    pool_costs_usd: Dict[str, float]
+    projected_pool_costs_usd: Dict[str, float]
+    projected_total_cost_usd: float
+    total_cost_gfw_nodes_usd: float
+    total_cost_keda_nodes_usd: float
 
 class SimulationResponse(BaseModel):
     summary: SimulationSummaryModel
@@ -59,7 +57,9 @@ class SimulationResponse(BaseModel):
     pods_by_node: Dict[str, List[PodViewModel]]
     violations: Dict[str, List[str]]
 
-class PodPatchSpec(BaseModel):
+# --- Mutation Models ---
+
+class PodOverrideModel(BaseModel):
     req_cpu_m: Optional[int] = None
     req_mem_b: Optional[int] = None
     tolerations: Optional[List[Dict[str, Any]]] = None
@@ -68,15 +68,14 @@ class PodPatchSpec(BaseModel):
 
 class OperationModel(BaseModel):
     op: str
-    namespace: Optional[str] = None
-    owner_kind: Optional[str] = None
-    owner_name: Optional[str] = None
+    pod_ids: List[str] = []
     node_name: Optional[str] = None
-    pod_ids: Optional[List[str]] = None
     target_pool: Optional[str] = None
+    namespace: Optional[str] = None
+    owner_name: Optional[str] = None
     include_system: bool = False
     include_daemonsets: bool = False
-    overrides: Optional[PodPatchSpec] = None
+    overrides: Optional[PodOverrideModel] = None
 
 class MutateRequest(BaseModel):
     operations: List[OperationModel]
