@@ -3,12 +3,12 @@
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>GFW Node & Cost Simulator</title>
+  <title>Node & Cost Simulator</title>
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
   <div class="topbar">
-    <div class="title">GFW Node & Cost Simulator</div>
+    <div class="title">Node & Cost Simulator</div>
     <div class="actions">
       <select id="selSnapshots" class="btn">
         <option disabled selected>Loading...</option>
@@ -27,13 +27,13 @@
     <div class="summary" id="summaryBlock">
         </div>
 
-    <div class="card viol-card" id="violCard">
+    <div class="card viol-card" id="logCard">
       <div class="hdr">
-        <h3 style="color:#ff6b6b">⚠️ Нарушения правил</h3>
-        <span class="pill red" id="violCount">0</span>
+        <h3 style="color:#f1c40f">📝 Журнал изменений</h3>
+        <span class="pill" id="logCount">0</span>
       </div>
       <div class="body" style="padding:0">
-        <div class="viol-list" id="violList">
+        <div class="viol-list" id="logList">
           </div>
       </div>
     </div>
@@ -87,7 +87,6 @@
               <tbody id="podsBody"></tbody>
             </table>
           </div>
-          <div class="msg" id="msg">Drag pod → drop on node to move it.</div>
         </div>
       </div>
     </div>
@@ -141,6 +140,8 @@
         </div>
     </div>
   </div>
+
+  <div class="msg" id="msg">Drag pod → drop on node to move it.</div>
 
   <script src="/static/app.js"></script>
 </body>

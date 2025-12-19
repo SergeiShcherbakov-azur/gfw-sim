@@ -1,16 +1,13 @@
-// static/app.js
 const state = {
   sim: null,
   nodes: [],
   selectedNode: null,
-  sortKey: "gfw",
+  sortKey: "default",
   sortDir: "desc",
-  pendingMove: null
+  sortMode: "req", 
+  pendingMove: null,
+  highlightedNodes: new Set()
 };
-
-// ... (Helpers: fmtUsd, fmtMiB, clampPct, el, apiGet, apiPost, apiMutateOne, setBusy, setMsg, loadSnapshotsList, listeners) ...
-// Оставьте весь код хелперов и обработчиков событий без изменений (как в предыдущем правильном ответе),
-// изменилась только логика сортировки в sortNodes.
 
 function fmtUsd(x) {
   if (x === null || x === undefined || isNaN(x)) return "0.00";
@@ -188,6 +185,14 @@ async function commitMove() {
     return;
   }
   const targetPool = targetNodeObj.nodepool;
+  
+  // Track affected nodes for highlighting
+  const sourceNodeObj = Object.entries(state.sim.pods_by_node).find(([n, pods]) => pods.find(p => p.pod_id === podId));
+  const sourceNode = sourceNodeObj ? sourceNodeObj[0] : null;
+  state.highlightedNodes.clear();
+  if(sourceNode) state.highlightedNodes.add(sourceNode);
+  if(targetNode) state.highlightedNodes.add(targetNode);
+
   let op = {};
   if (isOwner && plan.owner_name) {
     op = {
@@ -199,6 +204,7 @@ async function commitMove() {
       overrides: overrides
     };
   } else {
+    // Use specific node move
     op = {
       op: "move_pod_to_node",
       pod_ids: [podId],
@@ -256,6 +262,8 @@ function buildUsageBar(usage, allocTotal) {
   const usagePct = 100 * usageVal / denom;
   const bar = document.createElement("div");
   bar.className = "bar thin";
+  
+  // Tooltip with raw numbers
   const diff = usageVal - allocTotal;
   const diffText = diff > 0 ? `+${diff}` : "";
   bar.title = `Usage: ${usageVal} / Alloc: ${allocTotal} (${diffText})`;
@@ -266,9 +274,12 @@ function buildUsageBar(usage, allocTotal) {
     s.style.width = clampPct(usagePct).toFixed(3) + "%";
     bar.appendChild(s);
   } else {
+    // Overcommit
     const s1 = document.createElement("div");
     s1.className = "seg usage";
     s1.style.width = "100%";
+    
+    // Add text label for overflow
     const label = document.createElement("span");
     label.style.position = "absolute";
     label.style.right = "0";
@@ -277,10 +288,13 @@ function buildUsageBar(usage, allocTotal) {
     label.style.fontSize = "10px";
     label.style.fontWeight = "bold";
     label.textContent = `+${diff}`;
+    
+    // We need wrapper to position label relative to bar
     bar.style.position = "relative";
     bar.style.overflow = "visible"; 
+    
     const s2 = document.createElement("div");
-    s2.className = "seg over";
+    s2.className = "seg over"; // Red
     s2.style.width = "100%";
     bar.appendChild(s2);
     bar.appendChild(label);
@@ -304,79 +318,146 @@ function nodeMemPartsMiB(n) {
   };
 }
 
+function updateSortHeaders() {
+    document.querySelectorAll("th[data-sort]").forEach(th => {
+        // Reset text
+        const label = th.getAttribute("data-label");
+        if(!label) return;
+        
+        let suffix = "";
+        const key = th.dataset.sort;
+        
+        if (state.sortKey === key) {
+            const arrow = state.sortDir === "asc" ? "↑" : "↓";
+            let modeInfo = "";
+            if ((key === "cpu" || key === "ram") && state.sortMode === "use") {
+                modeInfo = " (Use)";
+            } else if ((key === "cpu" || key === "ram") && state.sortMode === "req") {
+                modeInfo = " (Req)";
+            }
+            suffix = ` ${arrow}${modeInfo}`;
+            th.style.color = "#fff";
+        } else {
+            th.style.color = "";
+        }
+        th.textContent = label + suffix;
+    });
+}
+
 function sortNodes() {
   const key = state.sortKey;
   const dir = state.sortDir === "asc" ? 1 : -1;
+  const mode = state.sortMode; // 'req' or 'use'
 
   const val = (n) => {
-    // === FIX: Virtual nodes ALWAYS on top ===
-    if (n.is_virtual) return -999999999 * dir; // Force top (or bottom depending on dir)
+    // 1. Virtual nodes always on top
+    if (n.is_virtual) return -999999999 * dir; 
     
+    // 2. Default Sort
+    if (key === "default") {
+        const aKeda = (n.nodepool || "").toLowerCase().includes("keda");
+        if (aKeda) return -1000000 * dir;
+        return n.node.localeCompare(n.node) * dir;
+    }
+
     if (key === "node") return n.node || "";
     if (key === "nodepool") return n.nodepool || "";
     if (key === "cost") return n.cost_daily_usd || 0;
-    if (key === "cpu") return (n.sum_req_cpu_m || 0) / Math.max(1, n.alloc_cpu_m || 1);
-    if (key === "ram") return (n.sum_req_mem_b || 0) / Math.max(1, n.alloc_mem_b || 1);
+    
+    if (key === "cpu") {
+        const div = Math.max(1, n.alloc_cpu_m || 1);
+        if (mode === "use") return (n.sum_usage_cpu_m || 0) / div;
+        return (n.sum_req_cpu_m || 0) / div;
+    }
+    
+    if (key === "ram") {
+        const div = Math.max(1, n.alloc_mem_b || 1);
+        if (mode === "use") return (n.sum_usage_mem_b || 0) / div;
+        return (n.sum_req_mem_b || 0) / div;
+    }
+    
     if (key === "gfw") return n.gfw_ratio_pct || 0;
     return 0;
   };
 
   state.nodes.sort((a, b) => {
-    // Custom logic to keep sim nodes sticky
     if (a.is_virtual && !b.is_virtual) return -1;
     if (!a.is_virtual && b.is_virtual) return 1;
 
-    const va = val(a),
-      vb = val(b);
+    const va = val(a), vb = val(b);
     if (typeof va === "string" || typeof vb === "string") {
       return String(va).localeCompare(String(vb)) * dir;
     }
     return (va - vb) * dir;
   });
+  
+  updateSortHeaders();
 }
 
-function renderViolations(sim) {
-  const v = sim.violations || {};
-  const keys = Object.keys(v);
-  const card = el("violCard");
-  const list = el("violList");
+function setupSortListeners() {
+    document.querySelectorAll("th[data-sort]").forEach(th => {
+        th.setAttribute("data-label", th.textContent);
+        
+        th.addEventListener("click", () => {
+            const key = th.dataset.sort;
+            
+            if (state.sortKey !== key) {
+                state.sortKey = key;
+                state.sortDir = 'desc';
+                state.sortMode = 'req'; 
+            } else {
+                if (key === 'cpu' || key === 'ram') {
+                    if (state.sortMode === 'req' && state.sortDir === 'desc') {
+                        state.sortDir = 'asc';
+                    } else if (state.sortMode === 'req' && state.sortDir === 'asc') {
+                        state.sortMode = 'use';
+                        state.sortDir = 'desc';
+                    } else if (state.sortMode === 'use' && state.sortDir === 'desc') {
+                        state.sortDir = 'asc';
+                    } else {
+                        state.sortMode = 'req';
+                        state.sortDir = 'desc';
+                    }
+                } else {
+                    state.sortDir = state.sortDir === 'asc' ? 'desc' : 'asc';
+                }
+            }
+            renderNodes();
+        });
+    });
+}
+
+function renderLogs(sim) {
+  const logs = sim.logs || [];
+  const card = el("logCard");
+  const list = el("logList");
   list.innerHTML = "";
-  if (!keys.length) {
-    card.style.display = "none";
-    return;
+  
+  if (!logs.length) {
+      list.innerHTML = `<div style="padding:12px;color:var(--muted);text-align:center">Нет изменений</div>`;
+  } else {
+      el("logCount").textContent = String(logs.length);
+      logs.slice(0, 50).forEach(log => {
+          const item = document.createElement("div");
+          item.className = "log-item";
+          const time = new Date(log.timestamp * 1000).toLocaleTimeString();
+          let html = `
+            <div style="display:flex;justify-content:space-between">
+                <span class="log-msg">${log.message}</span>
+                <span class="log-time">${time}</span>
+            </div>
+          `;
+          if (log.details && Object.keys(log.details).length > 0) {
+              const json = JSON.stringify(log.details, null, 2);
+              html += `<div class="log-details">${json}</div>`;
+              item.style.cursor = "pointer";
+              item.onclick = () => item.classList.toggle("open");
+          }
+          item.innerHTML = html;
+          list.appendChild(item);
+      });
   }
   card.style.display = "block";
-  el("violCount").textContent = String(keys.length);
-  keys.sort((a, b) => v[b].length - v[a].length);
-  for (const podId of keys.slice(0, 100)) {
-    const reasons = v[podId] || [];
-    const item = document.createElement("div");
-    item.className = "viol-item";
-    const nameDiv = document.createElement("div");
-    nameDiv.className = "viol-pod";
-    nameDiv.textContent = podId;
-    nameDiv.title = podId;
-    const msgsDiv = document.createElement("div");
-    msgsDiv.className = "viol-msgs";
-    reasons.forEach(r => {
-      const rDiv = document.createElement("span");
-      rDiv.className = "viol-msg";
-      rDiv.textContent = "• " + r;
-      msgsDiv.appendChild(rDiv);
-    });
-    item.appendChild(nameDiv);
-    item.appendChild(msgsDiv);
-    list.appendChild(item);
-  }
-  if (keys.length > 100) {
-    const more = document.createElement("div");
-    more.style.padding = "8px 12px";
-    more.style.color = "var(--muted)";
-    more.style.textAlign = "center";
-    more.style.fontSize = "11px";
-    more.textContent = `... и еще ${keys.length - 100} нарушений`;
-    list.appendChild(more);
-  }
 }
 
 function renderNodes() {
@@ -390,10 +471,13 @@ function renderNodes() {
     const tr = document.createElement("tr");
     tr.dataset.node = n.node;
     
-    // Highlight virtual nodes
     if (n.is_virtual) {
         tr.style.background = "rgba(52, 152, 219, 0.08)";
         tr.style.borderLeft = "2px solid #3498db";
+    }
+    
+    if (state.highlightedNodes.has(n.node)) {
+        tr.classList.add("row-highlight");
     }
 
     if (state.selectedNode && n.node === state.selectedNode) {
@@ -449,7 +533,6 @@ function renderNodes() {
     tdCost.className = "right mono";
     tdCost.textContent = fmtUsd(n.cost_daily_usd);
 
-    // CPU Column
     const tdCpu = document.createElement("td");
     const mCpu = document.createElement("div");
     mCpu.className = "metric";
@@ -472,7 +555,6 @@ function renderNodes() {
     mCpu.appendChild(barsCpu);
     tdCpu.appendChild(mCpu);
 
-    // RAM Column
     const tdRam = document.createElement("td");
     const mRam = document.createElement("div");
     mRam.className = "metric";
@@ -691,7 +773,7 @@ async function loadSim() {
       }
     }
     applySummary(sim);
-    renderViolations(sim);
+    renderLogs(sim);
     renderNodes();
     renderPods();
     setMsg("Готово. Перетащите pod на ноду для настройки переноса.");
@@ -760,5 +842,8 @@ el("btnCapture").addEventListener("click", async () => {
     setBusy(false);
   }
 });
+
+// Setup click handlers for sorting
+setupSortListeners();
 
 loadSnapshotsList().then(loadSim);

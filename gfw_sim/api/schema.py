@@ -11,7 +11,6 @@ class SimulationSummaryModel(BaseModel):
     total_cost_daily_usd: float
     total_cost_gfw_nodes_usd: float
     total_cost_keda_nodes_usd: float
-    # Изменили тип значений на модель с кол-вом нод
     pool_stats: Dict[str, PoolCostModel] = {} 
     projected_pool_stats: Dict[str, PoolCostModel] = {}
     projected_total_cost_usd: float = 0.0
@@ -54,15 +53,21 @@ class PodViewModel(BaseModel):
     is_system: bool
     req_cpu_m: int
     req_mem_b: int
-    usage_cpu_m: int = 0  # NEW
-    usage_mem_b: int = 0  # NEW
+    usage_cpu_m: int = 0
+    usage_mem_b: int = 0
     active_ratio: float = 1.0
+
+# --- NEW: Log Entry Model ---
+class LogEntry(BaseModel):
+    timestamp: float
+    message: str
+    details: Optional[Dict[str, Any]] = None
 
 class SimulationResponse(BaseModel):
     summary: SimulationSummaryModel
     nodes: List[NodeRowModel]
     pods_by_node: Dict[str, List[PodViewModel]]
-    violations: Dict[str, List[str]]
+    logs: List[LogEntry] = []  # Changed from violations to logs
 
 class PodPatchSpec(BaseModel):
     req_cpu_m: Optional[int] = None
