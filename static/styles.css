@@ -122,10 +122,16 @@ body {
   cursor: not-allowed;
 }
 
+/* --- Стилизация Select (Fix) --- */
 select.btn {
   background-color: #0b1222;
   appearance: none;
   padding-right: 30px;
+}
+
+/* Исправление: при наведении фон остается темным, а не становится прозрачно-белым */
+select.btn:hover {
+  background-color: #151b2b; /* Чуть светлее основного фона, но темный */
 }
 
 .wrap {

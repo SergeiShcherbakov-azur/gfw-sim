@@ -83,8 +83,9 @@ async function loadSnapshotsList() {
     list.forEach(s => {
       const opt = document.createElement("option");
       opt.value = s.id;
+      // Используем toLocaleString для даты
       const date = s.id.startsWith("k8s-") ?
-        new Date(parseInt(s.id.split("-")[1]) * 1000).toLocaleTimeString() :
+        new Date(parseInt(s.id.split("-")[1]) * 1000).toLocaleString() :
         s.id;
       opt.textContent = `${date} (${s.nodes_count}n / ${s.pods_count}p)`;
       if (s.is_active) opt.selected = true;
@@ -426,7 +427,6 @@ function setupSortListeners() {
     });
 }
 
-// --- POD SORTING ---
 function updatePodSortHeaders() {
     document.querySelectorAll("th[data-sort-pod]").forEach(th => {
         const label = th.getAttribute("data-label");
@@ -489,7 +489,6 @@ function setupPodSortListeners() {
     });
 }
 
-// --- LOGS ---
 function renderLogs(sim) {
   const logs = sim.logs || [];
   const list = el("changelogList");
@@ -679,6 +678,7 @@ function renderNodes() {
   }
 }
 
+// ВОТ ЗДЕСЬ ДОБАВЛЕНА ПРОПУЩЕННАЯ ФУНКЦИЯ RENDERPODS
 function renderPods() {
   const sim = state.sim;
   const node = state.selectedNode;
@@ -766,13 +766,6 @@ function renderPods() {
   }
 }
 
-function tag(txt, cls) {
-  const s = document.createElement("span");
-  s.className = "tag " + cls;
-  s.textContent = txt;
-  return s;
-}
-
 function applySummary(sim) {
   const histStats = sim.summary?.pool_stats || {};
   const projStats = sim.summary?.projected_pool_stats || {};
@@ -782,21 +775,6 @@ function applySummary(sim) {
 
   const container = el("summaryBlock");
   container.innerHTML = "";
-
-  // 1. ПОДСЧЕТ РЕАЛЬНЫХ СТАТИСТИК (ЭВРИСТИКА)
-  // Чтобы исправить баг с "default" пулом (когда история = 0, а по факту ноды есть),
-  // мы считаем, сколько реальных нод и какая у них стоимость прямо сейчас.
-  const realStats = {}; 
-  (state.nodes || []).forEach(n => {
-      if (!n.is_virtual) {
-          // Если nodepool не задан, считаем его 'default'
-          let pName = n.nodepool || "default";
-          
-          if (!realStats[pName]) realStats[pName] = { count: 0, cost: 0 };
-          realStats[pName].count++;
-          realStats[pName].cost += (n.cost_daily_usd || 0);
-      }
-  });
 
   const diffTotal = projTotal - histTotal;
   const signTotal = diffTotal > 0 ? "+" : "";
@@ -822,52 +800,33 @@ function applySummary(sim) {
     const h = histStats[pool] || { cost: 0, nodes_count: 0 };
     const p = projStats[pool] || { cost: 0, nodes_count: 0 };
 
-    // --- ПРИМЕНЕНИЕ ЭВРИСТИКИ ---
-    // Берем реальные данные для этого пула
-    const real = realStats[pool] || { count: 0, cost: 0 };
+    const costDiff = p.cost - h.cost;
+    const countDiff = p.nodes_count - h.nodes_count;
     
-    // Если исторические данные пусты (0), но реально ноды есть — используем реальные данные как базу.
-    // Это предотвращает показ ложного "+N nodes" и "+$Cost"
-    const baseNodes = (h.nodes_count === 0 && real.count > 0) ? real.count : h.nodes_count;
-    const baseCost = (h.cost < 0.001 && real.cost > 0) ? real.cost : h.cost;
-
-    // Считаем разницу от СКОРРЕКТИРОВАННОЙ базы
-    const costDiff = p.cost - baseCost;
-    const countDiff = p.nodes_count - baseNodes;
+    const sCost = costDiff > 0 ? "+" : "";
+    const cCost = Math.abs(costDiff) > 0.001 ? (costDiff > 0 ? "#e74c3c" : "#2ecc71") : "rgba(255,255,255,0.3)";
+    let subTextCost = `<span style="color:${cCost}">${sCost}${fmtUsd(costDiff)}</span>`;
     
-    // Cost Diff string
-    let diffCostStr = "";
-    if (Math.abs(costDiff) > 0.001) {
-        const s = costDiff > 0 ? "+" : "";
-        const c = costDiff > 0 ? "#e74c3c" : "#2ecc71";
-        diffCostStr = `<span style="color:${c}">(${s}${fmtUsd(costDiff)})</span>`;
-    }
-
-    // --- NODE COUNT DISPLAY LOGIC ---
-    let countText = `${p.nodes_count} nodes`;
+    let countText = `${h.nodes_count} nodes`;
     if (countDiff !== 0) {
-        const s = countDiff > 0 ? "+" : "";
-        // Red (#e74c3c) for ADD (+), Green (#2ecc71) for REMOVE (-)
-        const c = countDiff > 0 ? "#e74c3c" : "#2ecc71";
-        // Format: "Old -> New nodes (Diff)"
-        countText = `${baseNodes} → ${p.nodes_count} nodes <span style="color:${c};font-size:11px">(${s}${countDiff})</span>`;
+        const sCount = countDiff > 0 ? "+" : "";
+        const cCount = countDiff > 0 ? "#e74c3c" : "#2ecc71";
+        countText += ` <span style="color:${cCount};font-size:11px">(${sCount}${countDiff})</span>`;
     }
 
-    // Main Value: используем baseCost (который может быть скорректирован), чтобы не показывать $0.00, если данные не загрузились
-    let mainVal = fmtUsd(baseCost);
-    let subValLabel = "Actual"; 
-    
-    // Sub Value is Projected
-    let subText = `Proj: ${fmtUsd(p.cost)} ${diffCostStr}`;
-
-    // Special case: New Pool (действительно новый, которого нет в списке нод)
-    if (baseCost === 0 && baseNodes === 0 && (p.cost > 0 || p.nodes_count > 0)) {
-        subValLabel = "New";
+    let mainVal = fmtUsd(h.cost);
+    if (h.cost === 0 && h.nodes_count === 0) {
+      mainVal = fmtUsd(p.cost);
+      subTextCost = `<span style="color:var(--muted)">New</span>`;
+      countText = `${p.nodes_count} nodes <span style="color:#e74c3c;font-size:11px">(+${p.nodes_count})</span>`;
+    } else if (p.cost === 0 && p.nodes_count === 0) {
+        subTextCost = `<span style="color:#2ecc71">(-${fmtUsd(h.cost)})</span>`;
+        countText = `0 nodes <span style="color:#2ecc71;font-size:11px">(-${h.nodes_count})</span>`;
     }
 
     const card = document.createElement("div");
     card.className = "card";
-    // Add drag listeners for dropping pods on the pool card
+    // Add drag listeners
     card.dataset.pool = pool;
     card.addEventListener("dragover", (e) => {
         e.preventDefault();
@@ -889,9 +848,9 @@ function applySummary(sim) {
             <span class="pill" style="font-size:11px;padding:2px 6px">${countText}</span>
           </div>
           <div class="body">
-            <div class="big">${mainVal} <span style="font-size:14px;color:var(--muted);opacity:0.5">${subValLabel}</span></div>
+            <div class="big">${mainVal}</div>
             <div style="margin-top:4px; font-size:12px; font-family:var(--mono);">
-               ${subText}
+               Proj: ${fmtUsd(p.cost)} (${subTextCost})
             </div>
           </div>`;
     container.appendChild(card);
@@ -915,14 +874,11 @@ async function loadSim() {
     applySummary(sim);
     renderLogs(sim);
     
-    // HIGHLIGHT LOGIC PART 2: Find where the moved pod ended up
     state.highlightedNodes.clear();
     if (state.lastMovedPodId) {
-        // Search in all nodes for the pod
         for (const [nodeName, pods] of Object.entries(sim.pods_by_node || {})) {
             if (pods.find(p => p.pod_id === state.lastMovedPodId)) {
                 state.highlightedNodes.add(nodeName);
-                // Also select this node to show the pod immediately
                 state.selectedNode = nodeName;
                 break;
             }
@@ -999,7 +955,6 @@ el("btnCapture").addEventListener("click", async () => {
   }
 });
 
-// Setup click handlers for sorting
 setupSortListeners();
 setupPodSortListeners();
 
