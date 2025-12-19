@@ -5,8 +5,11 @@ const state = {
   sortKey: "default",
   sortDir: "desc",
   sortMode: "req", 
+  sortPodKey: "default",
+  sortPodDir: "desc",
   pendingMove: null,
-  highlightedNodes: new Set()
+  highlightedNodes: new Set(),
+  lastMovedPodId: null
 };
 
 function fmtUsd(x) {
@@ -130,11 +133,12 @@ el("btnCapture").addEventListener("click", async () => {
 function openModal(podId, targetNode, plan) {
   state.pendingMove = {
     podId,
-    targetNode,
+    targetNode, 
     plan
   };
   el("mPodId").textContent = podId;
-  el("mTargetNode").textContent = targetNode;
+  el("mTargetNode").textContent = targetNode; 
+  
   if (plan.owner_name && plan.owner_kind) {
     el("mOwnerGroup").style.display = "flex";
     el("mCheckOwner").checked = false;
@@ -154,6 +158,16 @@ function closeModal() {
   el("moveModalOverlay").style.display = "none";
   state.pendingMove = null;
 }
+
+// --- Changelog Modal Logic ---
+el("btnChangelog").addEventListener("click", () => {
+    el("changelogModal").style.display = "flex";
+});
+
+const closeChangelog = () => el("changelogModal").style.display = "none";
+el("btnCloseChangelog").addEventListener("click", closeChangelog);
+el("btnCloseChangelogBtn").addEventListener("click", closeChangelog);
+
 
 async function commitMove() {
   if (!state.pendingMove) return;
@@ -179,22 +193,16 @@ async function commitMove() {
     tolerations: tols,
     node_selector: sel
   };
-  const targetNodeObj = state.nodes.find(n => n.node === targetNode);
-  if (!targetNodeObj || !targetNodeObj.nodepool) {
-    alert("Целевая нода не имеет пула!");
-    return;
-  }
-  const targetPool = targetNodeObj.nodepool;
   
-  // Track affected nodes for highlighting
-  const sourceNodeObj = Object.entries(state.sim.pods_by_node).find(([n, pods]) => pods.find(p => p.pod_id === podId));
-  const sourceNode = sourceNodeObj ? sourceNodeObj[0] : null;
+  const targetNodeObj = state.nodes.find(n => n.node === targetNode);
+  const targetPool = targetNodeObj ? targetNodeObj.nodepool : null;
+  
+  // Track affected pod to highlight its new node later
+  state.lastMovedPodId = podId;
   state.highlightedNodes.clear();
-  if(sourceNode) state.highlightedNodes.add(sourceNode);
-  if(targetNode) state.highlightedNodes.add(targetNode);
 
   let op = {};
-  if (isOwner && plan.owner_name) {
+  if (isOwner && plan.owner_name && targetPool) {
     op = {
       op: "move_owner_to_pool",
       namespace: podId.split("/")[0],
@@ -204,7 +212,6 @@ async function commitMove() {
       overrides: overrides
     };
   } else {
-    // Use specific node move
     op = {
       op: "move_pod_to_node",
       pod_ids: [podId],
@@ -217,10 +224,11 @@ async function commitMove() {
   setMsg("Выполняется перенос...");
   try {
     await apiMutateOne(op);
-    await loadSim();
+    await loadSim(); 
     setMsg("Успешно перенесено!");
   } catch (e) {
     setMsg("Ошибка переноса: " + e.message, true);
+    state.lastMovedPodId = null;
   } finally {
     setBusy(false);
   }
@@ -263,7 +271,6 @@ function buildUsageBar(usage, allocTotal) {
   const bar = document.createElement("div");
   bar.className = "bar thin";
   
-  // Tooltip with raw numbers
   const diff = usageVal - allocTotal;
   const diffText = diff > 0 ? `+${diff}` : "";
   bar.title = `Usage: ${usageVal} / Alloc: ${allocTotal} (${diffText})`;
@@ -274,12 +281,10 @@ function buildUsageBar(usage, allocTotal) {
     s.style.width = clampPct(usagePct).toFixed(3) + "%";
     bar.appendChild(s);
   } else {
-    // Overcommit
     const s1 = document.createElement("div");
     s1.className = "seg usage";
     s1.style.width = "100%";
     
-    // Add text label for overflow
     const label = document.createElement("span");
     label.style.position = "absolute";
     label.style.right = "0";
@@ -289,7 +294,6 @@ function buildUsageBar(usage, allocTotal) {
     label.style.fontWeight = "bold";
     label.textContent = `+${diff}`;
     
-    // We need wrapper to position label relative to bar
     bar.style.position = "relative";
     bar.style.overflow = "visible"; 
     
@@ -320,7 +324,6 @@ function nodeMemPartsMiB(n) {
 
 function updateSortHeaders() {
     document.querySelectorAll("th[data-sort]").forEach(th => {
-        // Reset text
         const label = th.getAttribute("data-label");
         if(!label) return;
         
@@ -347,13 +350,11 @@ function updateSortHeaders() {
 function sortNodes() {
   const key = state.sortKey;
   const dir = state.sortDir === "asc" ? 1 : -1;
-  const mode = state.sortMode; // 'req' or 'use'
+  const mode = state.sortMode; 
 
   const val = (n) => {
-    // 1. Virtual nodes always on top
     if (n.is_virtual) return -999999999 * dir; 
     
-    // 2. Default Sort
     if (key === "default") {
         const aKeda = (n.nodepool || "").toLowerCase().includes("keda");
         if (aKeda) return -1000000 * dir;
@@ -375,8 +376,6 @@ function sortNodes() {
         if (mode === "use") return (n.sum_usage_mem_b || 0) / div;
         return (n.sum_req_mem_b || 0) / div;
     }
-    
-    if (key === "gfw") return n.gfw_ratio_pct || 0;
     return 0;
   };
 
@@ -427,16 +426,82 @@ function setupSortListeners() {
     });
 }
 
+// --- POD SORTING ---
+function updatePodSortHeaders() {
+    document.querySelectorAll("th[data-sort-pod]").forEach(th => {
+        const label = th.getAttribute("data-label");
+        if(!label) return;
+        
+        let suffix = "";
+        const key = th.dataset.sortPod;
+        
+        if (state.sortPodKey === key) {
+            const arrow = state.sortPodDir === "asc" ? "↑" : "↓";
+            suffix = ` ${arrow}`;
+            th.style.color = "#fff";
+        } else {
+            th.style.color = "";
+        }
+        th.textContent = label + suffix;
+    });
+}
+
+function sortPodsList(list) {
+    const key = state.sortPodKey;
+    const dir = state.sortPodDir === "asc" ? 1 : -1;
+
+    return list.slice().sort((a, b) => {
+        if (key === "default") {
+             if (a.is_daemon !== b.is_daemon) {
+                 return a.is_daemon ? 1 : -1;
+             }
+             return (b.req_cpu_m || 0) - (a.req_cpu_m || 0);
+        }
+
+        let va, vb;
+        if (key === "ns") { va = a.namespace; vb = b.namespace; }
+        else if (key === "name") { va = a.name; vb = b.name; }
+        else if (key === "active") { va = a.active_ratio ?? 1; vb = b.active_ratio ?? 1; }
+        else if (key === "type") { va = a.is_daemon ? 1 : 0; vb = b.is_daemon ? 1 : 0; }
+        else if (key === "cpu") { va = a.req_cpu_m || 0; vb = b.req_cpu_m || 0; }
+        else if (key === "mem") { va = a.req_mem_b || 0; vb = b.req_mem_b || 0; }
+        else { return 0; }
+
+        if (typeof va === "string") return va.localeCompare(vb) * dir;
+        return (va - vb) * dir;
+    });
+}
+
+function setupPodSortListeners() {
+    document.querySelectorAll("th[data-sort-pod]").forEach(th => {
+         th.setAttribute("data-label", th.textContent);
+         th.addEventListener("click", () => {
+             const key = th.dataset.sortPod;
+             if (state.sortPodKey === key) {
+                 state.sortPodDir = state.sortPodDir === 'asc' ? 'desc' : 'asc';
+             } else {
+                 state.sortPodKey = key;
+                 state.sortPodDir = 'desc'; 
+                 if (key === 'ns' || key === 'name') state.sortPodDir = 'asc';
+             }
+             renderPods();
+         });
+    });
+}
+
+// --- LOGS ---
 function renderLogs(sim) {
   const logs = sim.logs || [];
-  const card = el("logCard");
-  const list = el("logList");
+  const list = el("changelogList");
+  
+  const countEl = el("logCount");
+  if(countEl) countEl.textContent = String(logs.length);
+
   list.innerHTML = "";
   
   if (!logs.length) {
       list.innerHTML = `<div style="padding:12px;color:var(--muted);text-align:center">Нет изменений</div>`;
   } else {
-      el("logCount").textContent = String(logs.length);
       logs.slice(0, 50).forEach(log => {
           const item = document.createElement("div");
           item.className = "log-item";
@@ -457,8 +522,34 @@ function renderLogs(sim) {
           list.appendChild(item);
       });
   }
-  card.style.display = "block";
 }
+
+// Helper: Универсальная функция планирования перемещения в Пул
+async function handleMoveToPool(poolName, podId) {
+    if (!poolName) {
+        setMsg("Не удалось определить целевой NodePool.", true);
+        return;
+    }
+    
+    setMsg("Симулятор ищет лучшую ноду в пуле " + poolName + "...");
+    try {
+        const plan = await apiPost("/plan_move", {
+          pod_id: podId,
+          target_pool: poolName 
+        });
+        
+        const chosenNode = plan.target_node;
+        if (!chosenNode) {
+            throw new Error("Симулятор не вернул целевую ноду в плане.");
+        }
+        
+        openModal(podId, chosenNode, plan);
+        setMsg("Симулятор выбрал ноду " + chosenNode);
+    } catch (err) {
+        setMsg("Ошибка планирования: " + err.message, true);
+    }
+}
+
 
 function renderNodes() {
   const tb = el("nodesBody");
@@ -495,16 +586,11 @@ function renderNodes() {
       tr.classList.remove("droptarget");
       const podId = e.dataTransfer.getData("text/plain");
       if (!podId) return;
-      try {
-        setMsg("Анализ переноса...");
-        const plan = await apiPost("/plan_move", {
-          pod_id: podId,
-          target_node: n.node
-        });
-        openModal(podId, n.node, plan);
-        setMsg("Настройте параметры переноса.");
-      } catch (err) {
-        setMsg("Ошибка планирования: " + err.message, true);
+      
+      if (n.nodepool) {
+          handleMoveToPool(n.nodepool, podId);
+      } else {
+          setMsg("У выбранной ноды нет NodePool!", true);
       }
     });
     tr.addEventListener("click", () => {
@@ -603,7 +689,10 @@ function renderPods() {
     el("podsCount").textContent = "0";
     return;
   }
-  const list = (sim.pods_by_node && sim.pods_by_node[node]) ? sim.pods_by_node[node] : [];
+  
+  const rawList = (sim.pods_by_node && sim.pods_by_node[node]) ? sim.pods_by_node[node] : [];
+  const list = sortPodsList(rawList);
+  updatePodSortHeaders();
   el("podsCount").textContent = String(list.length);
 
   for (const p of list) {
@@ -694,6 +783,21 @@ function applySummary(sim) {
   const container = el("summaryBlock");
   container.innerHTML = "";
 
+  // 1. ПОДСЧЕТ РЕАЛЬНЫХ СТАТИСТИК (ЭВРИСТИКА)
+  // Чтобы исправить баг с "default" пулом (когда история = 0, а по факту ноды есть),
+  // мы считаем, сколько реальных нод и какая у них стоимость прямо сейчас.
+  const realStats = {}; 
+  (state.nodes || []).forEach(n => {
+      if (!n.is_virtual) {
+          // Если nodepool не задан, считаем его 'default'
+          let pName = n.nodepool || "default";
+          
+          if (!realStats[pName]) realStats[pName] = { count: 0, cost: 0 };
+          realStats[pName].count++;
+          realStats[pName].cost += (n.cost_daily_usd || 0);
+      }
+  });
+
   const diffTotal = projTotal - histTotal;
   const signTotal = diffTotal > 0 ? "+" : "";
   const colorTotal = diffTotal > 0.01 ? "#e74c3c" : (diffTotal < -0.01 ? "#2ecc71" : "rgba(255,255,255,0.5)");
@@ -705,7 +809,7 @@ function applySummary(sim) {
       <div class="body">
         <div class="big">${fmtUsd(histTotal)} <span style="font-size:14px;color:var(--muted)">ACTUAL</span></div>
         <div style="margin-top:4px; font-size:13px; font-family:var(--mono); color:var(--text)">
-           Projected: ${fmtUsd(projTotal)} 
+           Proj: ${fmtUsd(projTotal)} 
            <span style="color:${colorTotal}">(${signTotal}${fmtUsd(diffTotal)})</span>
         </div>
       </div>`;
@@ -718,41 +822,76 @@ function applySummary(sim) {
     const h = histStats[pool] || { cost: 0, nodes_count: 0 };
     const p = projStats[pool] || { cost: 0, nodes_count: 0 };
 
-    const costDiff = p.cost - h.cost;
-    const countDiff = p.nodes_count - h.nodes_count;
+    // --- ПРИМЕНЕНИЕ ЭВРИСТИКИ ---
+    // Берем реальные данные для этого пула
+    const real = realStats[pool] || { count: 0, cost: 0 };
     
-    const sCost = costDiff > 0 ? "+" : "";
-    const cCost = Math.abs(costDiff) > 0.001 ? (costDiff > 0 ? "#e74c3c" : "#2ecc71") : "rgba(255,255,255,0.3)";
-    let subTextCost = `<span style="color:${cCost}">${sCost}${fmtUsd(costDiff)}</span>`;
+    // Если исторические данные пусты (0), но реально ноды есть — используем реальные данные как базу.
+    // Это предотвращает показ ложного "+N nodes" и "+$Cost"
+    const baseNodes = (h.nodes_count === 0 && real.count > 0) ? real.count : h.nodes_count;
+    const baseCost = (h.cost < 0.001 && real.cost > 0) ? real.cost : h.cost;
+
+    // Считаем разницу от СКОРРЕКТИРОВАННОЙ базы
+    const costDiff = p.cost - baseCost;
+    const countDiff = p.nodes_count - baseNodes;
     
-    let countText = `${h.nodes_count} nodes`;
-    if (countDiff !== 0) {
-        const sCount = countDiff > 0 ? "+" : "";
-        const cCount = countDiff > 0 ? "#e74c3c" : "#2ecc71";
-        countText += ` <span style="color:${cCount};font-size:11px">(${sCount}${countDiff})</span>`;
+    // Cost Diff string
+    let diffCostStr = "";
+    if (Math.abs(costDiff) > 0.001) {
+        const s = costDiff > 0 ? "+" : "";
+        const c = costDiff > 0 ? "#e74c3c" : "#2ecc71";
+        diffCostStr = `<span style="color:${c}">(${s}${fmtUsd(costDiff)})</span>`;
     }
 
-    let mainVal = fmtUsd(h.cost);
-    if (h.cost === 0 && h.nodes_count === 0) {
-      mainVal = fmtUsd(p.cost);
-      subTextCost = `<span style="color:var(--muted)">New</span>`;
-      countText = `${p.nodes_count} nodes <span style="color:#e74c3c;font-size:11px">(+${p.nodes_count})</span>`;
-    } else if (p.cost === 0 && p.nodes_count === 0) {
-        subTextCost = `<span style="color:#2ecc71">(-${fmtUsd(h.cost)})</span>`;
-        countText = `0 nodes <span style="color:#2ecc71;font-size:11px">(-${h.nodes_count})</span>`;
+    // --- NODE COUNT DISPLAY LOGIC ---
+    let countText = `${p.nodes_count} nodes`;
+    if (countDiff !== 0) {
+        const s = countDiff > 0 ? "+" : "";
+        // Red (#e74c3c) for ADD (+), Green (#2ecc71) for REMOVE (-)
+        const c = countDiff > 0 ? "#e74c3c" : "#2ecc71";
+        // Format: "Old -> New nodes (Diff)"
+        countText = `${baseNodes} → ${p.nodes_count} nodes <span style="color:${c};font-size:11px">(${s}${countDiff})</span>`;
+    }
+
+    // Main Value: используем baseCost (который может быть скорректирован), чтобы не показывать $0.00, если данные не загрузились
+    let mainVal = fmtUsd(baseCost);
+    let subValLabel = "Actual"; 
+    
+    // Sub Value is Projected
+    let subText = `Proj: ${fmtUsd(p.cost)} ${diffCostStr}`;
+
+    // Special case: New Pool (действительно новый, которого нет в списке нод)
+    if (baseCost === 0 && baseNodes === 0 && (p.cost > 0 || p.nodes_count > 0)) {
+        subValLabel = "New";
     }
 
     const card = document.createElement("div");
     card.className = "card";
+    // Add drag listeners for dropping pods on the pool card
+    card.dataset.pool = pool;
+    card.addEventListener("dragover", (e) => {
+        e.preventDefault();
+        card.classList.add("droptarget");
+    });
+    card.addEventListener("dragleave", () => {
+        card.classList.remove("droptarget");
+    });
+    card.addEventListener("drop", (e) => {
+        e.preventDefault();
+        card.classList.remove("droptarget");
+        const podId = e.dataTransfer.getData("text/plain");
+        if (podId) handleMoveToPool(pool, podId);
+    });
+
     card.innerHTML = `
           <div class="hdr">
             <h3>${pool}</h3>
             <span class="pill" style="font-size:11px;padding:2px 6px">${countText}</span>
           </div>
           <div class="body">
-            <div class="big">${mainVal}</div>
+            <div class="big">${mainVal} <span style="font-size:14px;color:var(--muted);opacity:0.5">${subValLabel}</span></div>
             <div style="margin-top:4px; font-size:12px; font-family:var(--mono);">
-               Proj: ${fmtUsd(p.cost)} (${subTextCost})
+               ${subText}
             </div>
           </div>`;
     container.appendChild(card);
@@ -772,8 +911,25 @@ async function loadSim() {
         state.selectedNode = state.nodes.length ? state.nodes[0].node : null;
       }
     }
+    
     applySummary(sim);
     renderLogs(sim);
+    
+    // HIGHLIGHT LOGIC PART 2: Find where the moved pod ended up
+    state.highlightedNodes.clear();
+    if (state.lastMovedPodId) {
+        // Search in all nodes for the pod
+        for (const [nodeName, pods] of Object.entries(sim.pods_by_node || {})) {
+            if (pods.find(p => p.pod_id === state.lastMovedPodId)) {
+                state.highlightedNodes.add(nodeName);
+                // Also select this node to show the pod immediately
+                state.selectedNode = nodeName;
+                break;
+            }
+        }
+        state.lastMovedPodId = null; // Reset
+    }
+
     renderNodes();
     renderPods();
     setMsg("Готово. Перетащите pod на ноду для настройки переноса.");
@@ -845,5 +1001,6 @@ el("btnCapture").addEventListener("click", async () => {
 
 // Setup click handlers for sorting
 setupSortListeners();
+setupPodSortListeners();
 
 loadSnapshotsList().then(loadSim);

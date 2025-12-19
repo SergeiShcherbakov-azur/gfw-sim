@@ -129,8 +129,7 @@ select.btn {
 }
 
 .wrap {
-  /* Height reduced to account for header (54px) and new footer (~56px) + spacing */
-  height: calc(100vh - 110px);
+  height: calc(100vh - 140px);
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -149,15 +148,23 @@ select.btn {
   border-radius: var(--radius);
   box-shadow: var(--shadow);
   overflow: hidden;
+  transition: all 0.2s ease;
 }
 
+/* UPDATED HEADER STRUCTURE */
 .card .hdr {
   padding: 12px 14px 10px 14px;
   border-bottom: 1px solid var(--border);
   display: flex;
+  flex-direction: column;
+  gap: 8px; 
+}
+
+.hdr-row {
+  display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  width: 100%;
 }
 
 .card .hdr h3 {
@@ -171,6 +178,17 @@ select.btn {
 
 .card .body {
   padding: 12px 14px;
+}
+
+/* INSTRUCTION TEXT STYLE */
+.instruction-text {
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1.4;
+  white-space: normal;
+  font-weight: normal;
+  text-transform: none;
+  margin: 0;
 }
 
 .big {
@@ -200,23 +218,7 @@ select.btn {
   background: rgba(231, 76, 60, .1);
 }
 
-.viol-card {
-  display: none;
-  border: 1px solid rgba(241, 196, 15, 0.4);
-  background: linear-gradient(180deg, rgba(241, 196, 15, 0.05), rgba(10, 16, 32, 0.95));
-  max-height: 200px;
-  overflow: hidden;
-}
-
-.viol-list {
-  max-height: 160px;
-  overflow-y: auto;
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-  padding: 0;
-}
-
+/* Styles for log items inside modal */
 .log-item {
   padding: 8px 12px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.03);
@@ -241,10 +243,6 @@ select.btn {
     display: none; 
 }
 .log-item.open .log-details { display: block; }
-
-.viol-list::-webkit-scrollbar {
-  width: 6px;
-}
 
 table {
   border-collapse: collapse;
@@ -427,14 +425,6 @@ tbody tr.selected {
   background: var(--usage-bad);
 }
 
-.drop-hint {
-  font-size: 12px;
-  color: rgba(255, 255, 255, .65);
-  padding: 10px 14px;
-  border-top: 1px solid rgba(255, 255, 255, .06);
-  background: rgba(255, 255, 255, .02);
-}
-
 .pods-title {
   display: flex;
   align-items: center;
@@ -448,7 +438,6 @@ tbody tr.selected {
   color: rgba(255, 255, 255, .92);
 }
 
-/* Footer Log/Msg Styling */
 .msg {
   position: fixed;
   bottom: 0;
@@ -458,7 +447,7 @@ tbody tr.selected {
   border-top: 1px solid var(--border);
   font-size: 13px;
   color: var(--text);
-  background: #0b1222; /* Solid background to obscure content behind */
+  background: #0b1222;
   z-index: 1000;
   box-sizing: border-box;
   box-shadow: 0 -4px 15px rgba(0,0,0,0.5);
@@ -515,7 +504,7 @@ tbody tr.selected {
   display: none;
   align-items: center;
   justify-content: center;
-  z-index: 2000; /* Above footer */
+  z-index: 2000;
 }
 
 .modal {
@@ -622,7 +611,7 @@ textarea.inp {
   }
   .wrap {
     height: auto;
-    padding-bottom: 60px; /* Space for footer on mobile */
+    padding-bottom: 60px;
   }
   .grid {
     grid-template-columns: 1fr;

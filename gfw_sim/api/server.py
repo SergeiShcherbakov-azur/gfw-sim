@@ -28,7 +28,7 @@ from ..types import NodePoolName, PodId, NodeId
 from .schema import (
     SimulationResponse, SimulationSummaryModel, NodeRowModel, NodePartsModel,
     PodViewModel, MutateRequest, OperationModel, PlanMoveRequest, PlanMoveResponse,
-    PoolCostModel, LogEntry # NEW
+    PoolCostModel, LogEntry
 )
 
 app = FastAPI()
@@ -53,7 +53,6 @@ LEGACY_PATH = MODULE_ROOT / "snapshot" / "legacy.json"
 CURRENT_SNAPSHOT: Snapshot | None = None
 
 # --- STATE ---
-# Хранилище логов для каждого снапшота (id -> list[LogEntry])
 SNAPSHOT_LOGS: Dict[str, List[LogEntry]] = {}
 
 # --- Helpers ---
@@ -157,9 +156,6 @@ manager = SnapshotManager()
 def to_simulation_response(snapshot) -> SimulationResponse:
     sim = simulate.run_simulation(snapshot)
     
-    # Мы убрали валидацию Constraints, чтобы не захламлять лог
-    # Если нужно вернуть - раскомментируйте, но в ответе шлем логи
-    
     nodes_list = []
     for row in sim.nodes_table:
         nodes_list.append(
@@ -216,7 +212,6 @@ def to_simulation_response(snapshot) -> SimulationResponse:
         pods_by_node[node_name] = items
         
     logs = SNAPSHOT_LOGS.get(manager.active_id, [])
-    # Сортируем: новые сверху
     logs = sorted(logs, key=lambda x: x.timestamp, reverse=True)
 
     return SimulationResponse(
@@ -230,7 +225,7 @@ def to_simulation_response(snapshot) -> SimulationResponse:
         ),
         nodes=nodes_list,
         pods_by_node=pods_by_node,
-        logs=logs  # --- SEND LOGS INSTEAD OF VIOLATIONS
+        logs=logs
     )
 
 @app.on_event("startup")
@@ -366,8 +361,29 @@ def plan_move(req: PlanMoveRequest) -> PlanMoveResponse:
     
     pod = snap.pods.get(PodId(req.pod_id))
     if not pod: raise HTTPException(status_code=404, detail=f"Pod {req.pod_id} not found")
-    target_node = snap.nodes.get(NodeId(req.target_node))
-    if not target_node: raise HTTPException(status_code=404, detail=f"Target node {req.target_node} not found")
+
+    target_node_id_str = req.target_node
+    
+    # ЕСЛИ пришел target_pool, ищем любую ноду в этом пуле
+    if not target_node_id_str and req.target_pool:
+        found = False
+        # Ищем любую ноду, принадлежащую пулу
+        for nid, node in snap.nodes.items():
+            if getattr(node, "nodepool", None) == req.target_pool:
+                target_node_id_str = nid
+                found = True
+                break
+        
+        if not found:
+             # Если нод в пуле нет (например, пул схлопнулся до 0), мы не можем вывести suggestions.
+             # В реальности тут стоило бы смотреть definition пула, но у нас его может не быть в памяти.
+             raise HTTPException(status_code=404, detail=f"No active nodes found in pool '{req.target_pool}' to derive config from.")
+    
+    if not target_node_id_str:
+         raise HTTPException(status_code=422, detail="Either target_node or target_pool must be provided and valid.")
+
+    target_node = snap.nodes.get(NodeId(target_node_id_str))
+    if not target_node: raise HTTPException(status_code=404, detail=f"Target node {target_node_id_str} not found")
 
     target_pool_name = getattr(target_node, "nodepool", None)
     target_pool = snap.nodepools.get(target_pool_name) if target_pool_name else None
@@ -385,6 +401,7 @@ def plan_move(req: PlanMoveRequest) -> PlanMoveResponse:
 
     return PlanMoveResponse(
         pod_id=req.pod_id,
+        target_node=target_node_id_str, # Возвращаем выбранную ноду
         owner_kind=owner_kind,
         owner_name=owner_name,
         current_req_cpu_m=int(pod.req_cpu_m or 0),
@@ -427,7 +444,6 @@ def mutate(req: MutateRequest | OperationModel) -> SimulationResponse:
                 manager.add("working-copy", snap)
                 manager.set_active("working-copy")
             
-            # Clear logs on reset
             if manager.active_id in SNAPSHOT_LOGS:
                 SNAPSHOT_LOGS[manager.active_id] = []
             _add_log("Simulation reset to baseline")
@@ -498,7 +514,6 @@ def mutate(req: MutateRequest | OperationModel) -> SimulationResponse:
             snap = move_node_pods_to_pool(snap, op.node_name, NodePoolName(op.target_pool), overrides=op.overrides)
             _add_log(f"Evacuated Node {op.node_name} to pool {op.target_pool}")
         elif op.op == "move_pods_to_pool":
-            # legacy op
             pass
         elif op.op == "delete_pods":
             snap = delete_pods(snap, [PodId(pid) for pid in op.pod_ids])

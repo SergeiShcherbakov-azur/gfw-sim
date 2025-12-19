@@ -20,29 +20,24 @@
       <button class="btn blue" id="btnRefresh">Обновить</button>
       <button class="btn red" id="btnReset">Сбросить</button>
       <button class="btn green" id="btnRefreshPrices">Цены AWS</button>
+      <button class="btn" id="btnChangelog">📜 История</button>
     </div>
   </div>
 
   <div class="wrap">
     <div class="summary" id="summaryBlock">
-        </div>
-
-    <div class="card viol-card" id="logCard">
-      <div class="hdr">
-        <h3 style="color:#f1c40f">📝 Журнал изменений</h3>
-        <span class="pill" id="logCount">0</span>
       </div>
-      <div class="body" style="padding:0">
-        <div class="viol-list" id="logList">
-          </div>
-      </div>
-    </div>
 
     <div class="grid">
       <div class="card panel">
         <div class="hdr">
-          <h3>Ноды</h3>
-          <div class="pods-title"><span class="pill" id="nodesCount">0</span></div>
+          <div class="hdr-row">
+            <h3>Ноды</h3>
+            <div class="pods-title"><span class="pill" id="nodesCount">0</span></div>
+          </div>
+          <p class="instruction-text">
+            Перетащите pod из правой таблицы на строку ноды слева — откроется окно настройки переноса.
+          </p>
         </div>
         <div class="body">
           <div class="table-wrap" id="nodesWrap">
@@ -59,16 +54,17 @@
               <tbody id="nodesBody"></tbody>
             </table>
           </div>
-          <div class="drop-hint">Перетащите pod из правой таблицы на строку ноды слева — откроется окно настройки переноса.</div>
         </div>
       </div>
 
       <div class="card panel">
         <div class="hdr">
-          <h3>Поды на выбранной ноде</h3>
-          <div class="pods-title">
-            <span>Нода: <strong id="selNode">—</strong></span>
-            <span class="pill" id="podsCount">0</span>
+          <div class="hdr-row">
+            <h3>Поды на выбранной ноде</h3>
+            <div class="pods-title">
+              <span>Нода: <strong id="selNode">—</strong></span>
+              <span class="pill" id="podsCount">0</span>
+            </div>
           </div>
         </div>
         <div class="body">
@@ -76,11 +72,12 @@
             <table>
               <thead>
                 <tr>
-                  <th class="nosort">Namespace</th>
-                  <th class="nosort">Pod</th>
-                  <th class="nosort right">Active</th> <th class="nosort">Type</th>
-                  <th class="nosort right">CPU (m)</th>
-                  <th class="nosort right">RAM (MiB)</th>
+                  <th data-sort-pod="ns" class="mono">Namespace</th>
+                  <th data-sort-pod="name" class="mono">Pod</th>
+                  <th data-sort-pod="active" class="right">Active</th> 
+                  <th data-sort-pod="type">Type</th>
+                  <th data-sort-pod="cpu" class="right">CPU (m)</th>
+                  <th data-sort-pod="mem" class="right">RAM (MiB)</th>
                   <th class="nosort">Flags</th>
                 </tr>
               </thead>
@@ -137,6 +134,20 @@
         <div class="modal-ftr">
             <button class="btn" onclick="closeModal()">Отмена</button>
             <button class="btn blue" onclick="commitMove()">Применить и перенести</button>
+        </div>
+    </div>
+  </div>
+
+  <div class="modal-overlay" id="changelogModal">
+    <div class="modal" style="width: 700px;">
+        <div class="modal-hdr">
+            <span>📝 Журнал изменений <span class="pill" id="logCount">0</span></span>
+            <span style="cursor:pointer" id="btnCloseChangelog">✕</span>
+        </div>
+        <div class="modal-body" id="changelogList">
+        </div>
+        <div class="modal-ftr">
+            <button class="btn" id="btnCloseChangelogBtn">Закрыть</button>
         </div>
     </div>
   </div>

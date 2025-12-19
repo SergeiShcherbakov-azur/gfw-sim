@@ -67,7 +67,7 @@ class SimulationResponse(BaseModel):
     summary: SimulationSummaryModel
     nodes: List[NodeRowModel]
     pods_by_node: Dict[str, List[PodViewModel]]
-    logs: List[LogEntry] = []  # Changed from violations to logs
+    logs: List[LogEntry] = []
 
 class PodPatchSpec(BaseModel):
     req_cpu_m: Optional[int] = None
@@ -93,10 +93,14 @@ class MutateRequest(BaseModel):
 
 class PlanMoveRequest(BaseModel):
     pod_id: str
-    target_node: str
+    # Теперь target_node опционален, если передан target_pool
+    target_node: Optional[str] = None
+    target_pool: Optional[str] = None
 
 class PlanMoveResponse(BaseModel):
     pod_id: str
+    # Возвращаем выбранную ноду, чтобы фронт мог её подсветить
+    target_node: Optional[str] = None 
     owner_kind: Optional[str]
     owner_name: Optional[str]
     current_req_cpu_m: int
