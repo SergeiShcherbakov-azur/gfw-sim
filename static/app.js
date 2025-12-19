@@ -766,6 +766,13 @@ function renderPods() {
   }
 }
 
+function tag(txt, cls) {
+  const s = document.createElement("span");
+  s.className = "tag " + cls;
+  s.textContent = txt;
+  return s;
+}
+
 function applySummary(sim) {
   const histStats = sim.summary?.pool_stats || {};
   const projStats = sim.summary?.projected_pool_stats || {};
@@ -775,6 +782,21 @@ function applySummary(sim) {
 
   const container = el("summaryBlock");
   container.innerHTML = "";
+
+    // 1. ПОДСЧЕТ РЕАЛЬНЫХ СТАТИСТИК (ЭВРИСТИКА)
+  // Чтобы исправить баг с "default" пулом (когда история = 0, а по факту ноды есть),
+  // мы считаем, сколько реальных нод и какая у них стоимость прямо сейчас.
+  const realStats = {}; 
+  (state.nodes || []).forEach(n => {
+      if (!n.is_virtual) {
+          // Если nodepool не задан, считаем его 'default'
+          let pName = n.nodepool || "default";
+          
+          if (!realStats[pName]) realStats[pName] = { count: 0, cost: 0 };
+          realStats[pName].count++;
+          realStats[pName].cost += (n.cost_daily_usd || 0);
+      }
+  });
 
   const diffTotal = projTotal - histTotal;
   const signTotal = diffTotal > 0 ? "+" : "";
@@ -800,28 +822,45 @@ function applySummary(sim) {
     const h = histStats[pool] || { cost: 0, nodes_count: 0 };
     const p = projStats[pool] || { cost: 0, nodes_count: 0 };
 
-    const costDiff = p.cost - h.cost;
-    const countDiff = p.nodes_count - h.nodes_count;
-    
+    const real = realStats[pool] || { count: 0, cost: 0 };
+    const baseNodes = (h.nodes_count === 0 && real.count > 0) ? real.count : h.nodes_count;
+    const baseCost = (h.cost < 0.001 && real.cost > 0) ? real.cost : h.cost;
+
+    // Считаем разницу от СКОРРЕКТИРОВАННОЙ базы
+    const costDiff = p.cost - baseCost;
+    const countDiff = p.nodes_count - baseNodes;
+
     const sCost = costDiff > 0 ? "+" : "";
     const cCost = Math.abs(costDiff) > 0.001 ? (costDiff > 0 ? "#e74c3c" : "#2ecc71") : "rgba(255,255,255,0.3)";
     let subTextCost = `<span style="color:${cCost}">${sCost}${fmtUsd(costDiff)}</span>`;
     
-    let countText = `${h.nodes_count} nodes`;
-    if (countDiff !== 0) {
-        const sCount = countDiff > 0 ? "+" : "";
-        const cCount = countDiff > 0 ? "#e74c3c" : "#2ecc71";
-        countText += ` <span style="color:${cCount};font-size:11px">(${sCount}${countDiff})</span>`;
+    let diffCostStr = "";
+    if (Math.abs(costDiff) > 0.001) {
+        const s = costDiff > 0 ? "+" : "";
+        const c = costDiff > 0 ? "#e74c3c" : "#2ecc71";
+        diffCostStr = `<span style="color:${c}">(${s}${fmtUsd(costDiff)})</span>`;
     }
 
-    let mainVal = fmtUsd(h.cost);
-    if (h.cost === 0 && h.nodes_count === 0) {
-      mainVal = fmtUsd(p.cost);
-      subTextCost = `<span style="color:var(--muted)">New</span>`;
-      countText = `${p.nodes_count} nodes <span style="color:#e74c3c;font-size:11px">(+${p.nodes_count})</span>`;
-    } else if (p.cost === 0 && p.nodes_count === 0) {
-        subTextCost = `<span style="color:#2ecc71">(-${fmtUsd(h.cost)})</span>`;
-        countText = `0 nodes <span style="color:#2ecc71;font-size:11px">(-${h.nodes_count})</span>`;
+    // --- NODE COUNT DISPLAY LOGIC ---
+    let countText = `${p.nodes_count} nodes`;
+    if (countDiff !== 0) {
+        const s = countDiff > 0 ? "+" : "";
+        // Red (#e74c3c) for ADD (+), Green (#2ecc71) for REMOVE (-)
+        const c = countDiff > 0 ? "#e74c3c" : "#2ecc71";
+        // Format: "Old -> New nodes (Diff)"
+        countText = `${baseNodes} → ${p.nodes_count} nodes <span style="color:${c};font-size:11px">(${s}${countDiff})</span>`;
+    }
+
+    // Main Value: используем baseCost (который может быть скорректирован), чтобы не показывать $0.00, если данные не загрузились
+    let mainVal = fmtUsd(baseCost);
+    let subValLabel = "Actual"; 
+    
+    // Sub Value is Projected
+    let subText = `Proj: ${fmtUsd(p.cost)} ${diffCostStr}`;
+
+    // Special case: New Pool (действительно новый, которого нет в списке нод)
+    if (baseCost === 0 && baseNodes === 0 && (p.cost > 0 || p.nodes_count > 0)) {
+        subValLabel = "New";
     }
 
     const card = document.createElement("div");
